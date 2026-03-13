@@ -363,9 +363,7 @@ function updateTabAndWait(tabId, url) {
 
 function buildTaobaoSearchUrl(keyword, page) {
   const url = new URL(TAOBAO_SEARCH_URL);
-  const offset = Math.max(0, page - 1) * 44;
   url.searchParams.set("page", String(page));
-  url.searchParams.set("s", String(offset));
   url.searchParams.set("q", keyword);
   url.searchParams.set("tab", "all");
   return url.toString();
