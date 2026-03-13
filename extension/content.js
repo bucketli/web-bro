@@ -212,13 +212,20 @@ async function runTaobaoSearch(keyword) {
 async function collectTaobaoItems(page) {
   await waitForTaobaoItems();
 
-  const items = findTaobaoItemNodes()
+  const lookup = findTaobaoItemNodesWithSelector();
+  const items = lookup.nodes
     .map((node) => parseTaobaoItem(node, page))
     .filter((item) => item.title && item.link);
 
   return {
     ok: true,
-    items
+    items,
+    debug: {
+      page,
+      selector: lookup.selector,
+      nodeCount: lookup.nodes.length,
+      itemCount: items.length
+    }
   };
 }
 
@@ -263,7 +270,7 @@ function waitForElement(selectors, timeoutMs = 15000) {
 }
 
 function waitForTaobaoItems(timeoutMs = 15000) {
-  const existing = findTaobaoItemNodes();
+  const existing = findTaobaoItemNodesWithSelector().nodes;
   if (existing.length) {
     return Promise.resolve();
   }
@@ -275,7 +282,7 @@ function waitForTaobaoItems(timeoutMs = 15000) {
     }, timeoutMs);
 
     const observer = new MutationObserver(() => {
-      const nodes = findTaobaoItemNodes();
+      const nodes = findTaobaoItemNodesWithSelector().nodes;
       if (!nodes.length) {
         return;
       }
@@ -293,6 +300,10 @@ function waitForTaobaoItems(timeoutMs = 15000) {
 }
 
 function findTaobaoItemNodes() {
+  return findTaobaoItemNodesWithSelector().nodes;
+}
+
+function findTaobaoItemNodesWithSelector() {
   const selectors = [
     '[data-id][class*="doubleCardWrapper"]',
     '[data-id][class*="Card--"]',
@@ -304,11 +315,17 @@ function findTaobaoItemNodes() {
   for (const selector of selectors) {
     const nodes = Array.from(document.querySelectorAll(selector));
     if (nodes.length >= 3) {
-      return nodes;
+      return {
+        selector,
+        nodes
+      };
     }
   }
 
-  return [];
+  return {
+    selector: "",
+    nodes: []
+  };
 }
 
 function parseTaobaoItem(node, page) {
