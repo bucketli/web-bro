@@ -180,8 +180,18 @@ async function runTaobaoGuide(taskId, normalizedKeyword) {
       });
 
       const pageUrl = buildTaobaoSearchUrl(normalizedKeyword, page);
-      await chrome.tabs.update(workerTabId, { url: pageUrl });
-      await waitForTabComplete(workerTabId);
+      console.log("[taobao-guide] open search page", {
+        taskId,
+        page,
+        pageUrl
+      });
+      await updateTabAndWait(workerTabId, pageUrl);
+      const currentTab = await chrome.tabs.get(workerTabId);
+      console.log("[taobao-guide] page loaded", {
+        taskId,
+        page,
+        currentUrl: currentTab && currentTab.url ? currentTab.url : ""
+      });
       await ensureContentScript(workerTabId);
 
       const pageResult = await chrome.tabs.sendMessage(workerTabId, {
@@ -311,9 +321,51 @@ function waitForTabComplete(tabId) {
   });
 }
 
+function updateTabAndWait(tabId, url) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(handleUpdated);
+      reject(new Error("淘宝页面加载超时"));
+    }, 20000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(handleUpdated);
+    }
+
+    function handleUpdated(updatedTabId, changeInfo, updatedTab) {
+      if (updatedTabId !== tabId) {
+        return;
+      }
+
+      if (changeInfo.status === "complete" && updatedTab && updatedTab.url === url) {
+        cleanup();
+        resolve(updatedTab);
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(handleUpdated);
+
+    chrome.tabs.update(tabId, { url }, (updatedTab) => {
+      if (chrome.runtime.lastError) {
+        cleanup();
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      if (updatedTab && updatedTab.status === "complete" && updatedTab.url === url) {
+        cleanup();
+        resolve(updatedTab);
+      }
+    });
+  });
+}
+
 function buildTaobaoSearchUrl(keyword, page) {
   const url = new URL(TAOBAO_SEARCH_URL);
+  const offset = Math.max(0, page - 1) * 44;
   url.searchParams.set("page", String(page));
+  url.searchParams.set("s", String(offset));
   url.searchParams.set("q", keyword);
   url.searchParams.set("tab", "all");
   return url.toString();
