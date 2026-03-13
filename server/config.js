@@ -8,6 +8,7 @@ const defaultConfig = {
   requestTimeoutMs: 90000,
   maxInputChars: {
     text: 400,
+    documentContent: 12000,
     htmlSnippet: 600,
     interactiveHtml: 2400,
     metaDescription: 300,

@@ -17,6 +17,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "COLLECT_YUQUE_DOC") {
+    try {
+      sendResponse(collectYuqueDoc());
+    } catch (error) {
+      sendResponse({ ok: false, error: error.message });
+    }
+    return false;
+  }
+
+  if (message.type === "APPLY_YUQUE_OPTIMIZED_CONTENT") {
+    applyYuqueOptimizedContent(message.optimizedContent)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
   if (message.type === "RUN_TAOBAO_SEARCH") {
     runTaobaoSearch(message.keyword)
       .then((result) => sendResponse(result))
@@ -59,6 +75,45 @@ function collectPageData() {
   };
 }
 
+function collectYuqueDoc() {
+  if (!isYuquePage()) {
+    throw new Error("当前页面不是羽雀文档页");
+  }
+
+  const titleInput = document.querySelector('textarea[data-testid="input"]');
+  const titleNode = document.querySelector(".index-module_title_e9d9E");
+  const editorRoot =
+    document.querySelector(".ne-engine") ||
+    document.querySelector("#doc-reader-content .ne-engine") ||
+    document.querySelector("#doc-reader-content");
+
+  if (!editorRoot) {
+    throw new Error("未找到羽雀文档内容区域");
+  }
+
+  const title = normalizeWhitespace(
+    titleInput && "value" in titleInput
+      ? titleInput.value
+      : titleNode
+        ? titleNode.textContent
+        : document.title
+  );
+  const content = extractYuqueText(editorRoot);
+
+  if (!content) {
+    throw new Error("未读取到羽雀文档正文");
+  }
+
+  return {
+    title,
+    url: window.location.href,
+    goal: "",
+    content,
+    isEditMode: isYuqueEditMode(),
+    capturedAt: new Date().toISOString()
+  };
+}
+
 function extractVisibleText(root) {
   if (!root) {
     return "";
@@ -73,6 +128,64 @@ function extractVisibleText(root) {
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .join("\n");
+}
+
+function extractYuqueText(root) {
+  const blocks = Array.from(
+    root.querySelectorAll(
+      "ne-h1, ne-h2, ne-h3, ne-h4, ne-p, ne-oli, ne-tli, ne-table-hole, ne-hole[data-card='codeblock']"
+    )
+  );
+
+  if (!blocks.length) {
+    return normalizeWhitespace(root.innerText || root.textContent || "");
+  }
+
+  const lines = blocks
+    .map((block) => formatYuqueBlock(block))
+    .filter(Boolean);
+
+  return lines.join("\n\n").trim();
+}
+
+function formatYuqueBlock(block) {
+  const tagName = block.tagName ? block.tagName.toLowerCase() : "";
+  const text = normalizeWhitespace(block.innerText || block.textContent || "");
+  if (!text) {
+    return "";
+  }
+
+  if (tagName === "ne-h1") {
+    return `# ${text}`;
+  }
+
+  if (tagName === "ne-h2") {
+    return `## ${text}`;
+  }
+
+  if (tagName === "ne-h3") {
+    return `### ${text}`;
+  }
+
+  if (tagName === "ne-h4") {
+    return `#### ${text}`;
+  }
+
+  if (tagName === "ne-oli") {
+    const marker = block.querySelector(".ne-list-symbol");
+    const prefix = normalizeWhitespace(marker ? marker.textContent : "") || "1";
+    return `${prefix}. ${text}`;
+  }
+
+  if (tagName === "ne-tli") {
+    return `- ${text}`;
+  }
+
+  if (tagName === "ne-hole") {
+    return `\`\`\`\n${text}\n\`\`\``;
+  }
+
+  return text;
 }
 
 function cleanHtml(html) {
@@ -165,6 +278,36 @@ function truncate(value, limit) {
   }
 
   return `${value.slice(0, limit)}...`;
+}
+
+async function applyYuqueOptimizedContent(optimizedContent) {
+  const normalizedContent = String(optimizedContent || "").trim();
+  if (!normalizedContent) {
+    throw new Error("缺少优化后的文档内容");
+  }
+
+  if (!isYuquePage()) {
+    throw new Error("当前页面不是羽雀文档页");
+  }
+
+  await ensureYuqueEditMode();
+
+  const editor = await waitForElement([".ne-engine[contenteditable='true']", ".ne-engine"]);
+  replaceEditorContent(editor, normalizedContent);
+
+  await wait(400);
+
+  const publishButton = await waitForElement([
+    "#lake-doc-publish-button",
+    '[data-testid="PublishButton:doc-publish-button"]'
+  ]);
+
+  publishButton.click();
+
+  return {
+    ok: true,
+    updated: true
+  };
 }
 
 async function runTaobaoSearch(keyword) {
@@ -268,6 +411,67 @@ function waitForElement(selectors, timeoutMs = 15000) {
       subtree: true
     });
   });
+}
+
+async function ensureYuqueEditMode() {
+  if (isYuqueEditMode()) {
+    return;
+  }
+
+  const editButton = findYuqueEditButton();
+  if (!editButton) {
+    throw new Error("未找到羽雀编辑按钮，请先手动进入编辑模式");
+  }
+
+  editButton.click();
+  await waitForElement([".ne-engine[contenteditable='true']", ".lakex-editor-wrapper"], 15000);
+}
+
+function findYuqueEditButton() {
+  const candidates = Array.from(
+    document.querySelectorAll("button, a, [role='button'], .ant-btn, span")
+  );
+
+  return candidates.find((element) => {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const text = normalizeWhitespace(element.innerText || element.textContent || "");
+    if (text !== "编辑") {
+      return false;
+    }
+
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }) || null;
+}
+
+function replaceEditorContent(editor, content) {
+  editor.focus();
+
+  const selection = window.getSelection();
+  if (!selection) {
+    throw new Error("无法获取编辑器选择区");
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  const deleted = document.execCommand("delete", false);
+  const inserted = document.execCommand("insertText", false, content);
+
+  if (!deleted && !inserted) {
+    editor.textContent = content;
+  }
+
+  editor.dispatchEvent(new InputEvent("input", {
+    bubbles: true,
+    data: content,
+    inputType: "insertText"
+  }));
 }
 
 function waitForTaobaoItems(timeoutMs = 15000) {
@@ -598,6 +802,23 @@ function normalizeTaobaoLink(link) {
   }
 
   return value;
+}
+
+function isYuquePage() {
+  return /yuque\.com$/i.test(window.location.hostname) || /yuque\.com/i.test(window.location.href);
+}
+
+function isYuqueEditMode() {
+  return Boolean(
+    document.body &&
+    document.body.className.includes("editModeBody")
+  ) || Boolean(document.querySelector(".ne-engine[contenteditable='true']"));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function focusAndSetValue(input, value) {

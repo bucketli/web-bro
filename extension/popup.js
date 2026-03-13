@@ -49,6 +49,32 @@ const FEATURES = [
         detail: "扩展会自动点击搜索按钮或提交搜索表单"
       }
     ]
+  },
+  {
+    id: "yuque-optimize",
+    title: "羽雀文档优化",
+    description: "按目标优化当前羽雀文档，并自动写回后发布",
+    actionLabel: "执行羽雀文档优化",
+    loadingLabel: "正在分析并优化羽雀文档...",
+    successLabel: "羽雀文档已优化并触发更新",
+    messageType: "OPTIMIZE_YUQUE_DOC",
+    summaryTitle: "优化总结",
+    functionsTitle: "优化动作",
+    requiresBackend: true,
+    requiresInput: true,
+    inputLabel: "优化目标",
+    inputPlaceholder: "例如：改得更专业、更清晰，并补全步骤说明",
+    emptyInputMessage: "请输入优化目标",
+    emptyFunctions: [
+      {
+        name: "读取文档内容",
+        detail: "扩展会抓取当前羽雀页面中的标题和正文内容"
+      },
+      {
+        name: "自动回填更新",
+        detail: "优化结果会自动写回编辑器，并点击更新按钮发布"
+      }
+    ]
   }
 ];
 
@@ -96,7 +122,7 @@ buttonEl.addEventListener("click", async () => {
 
     const payload = response.data && response.data.data ? response.data.data : {};
     const summary = payload.summary;
-    const functions = payload.functions;
+    const functions = payload.functions || payload.changes;
     renderBestItem(payload.bestItem || null);
     renderSummary(Array.isArray(summary) ? summary : feature.emptySummary || []);
     renderFunctions(Array.isArray(functions) ? functions : feature.emptyFunctions || []);

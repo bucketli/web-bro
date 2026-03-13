@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { loadConfig, hasRealApiKey } = require("./config");
-const { analyzePage, analyzeTaobaoItems } = require("./llm");
+const { analyzePage, analyzeTaobaoItems, analyzeYuqueDoc } = require("./llm");
 
 const app = express();
 const host = "127.0.0.1";
@@ -104,6 +104,45 @@ app.post("/api/taobao-guide", async (req, res) => {
       providerOverride: providerOverride || "",
       keyword: payload.keyword || "",
       itemCount: Array.isArray(payload.items) ? payload.items.length : 0
+    });
+
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/optimize-yuque", async (req, res) => {
+  const payload = req.body || {};
+  const providerOverride = typeof req.query.provider === "string"
+    ? req.query.provider
+    : typeof payload.provider === "string"
+      ? payload.provider
+      : "";
+
+  try {
+    console.log("[optimize-yuque] analyze request", {
+      title: payload.title || "",
+      goal: payload.goal || "",
+      contentLength: String(payload.content || "").length
+    });
+
+    const config = loadConfig();
+    const result = await analyzeYuqueDoc(payload, config, providerOverride);
+
+    res.json({
+      ok: true,
+      data: result
+    });
+  } catch (error) {
+    console.error("[optimize-yuque] request failed", {
+      message: error.message,
+      stack: error.stack,
+      providerOverride: providerOverride || "",
+      title: payload.title || "",
+      goal: payload.goal || "",
+      contentLength: String(payload.content || "").length
     });
 
     res.status(500).json({
