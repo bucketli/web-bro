@@ -89,6 +89,53 @@ async function analyzeTaobaoItems(payload, config, providerOverride) {
   }
 }
 
+async function analyzeYuqueDoc(payload, config, providerOverride) {
+  const providerName = providerOverride || config.defaultProvider || "mock";
+  const goal = String(payload.goal || "").trim();
+  const title = String(payload.title || "").trim();
+  const content = String(payload.content || "").trim();
+
+  if (!goal) {
+    throw new Error("Missing goal");
+  }
+
+  if (!content) {
+    throw new Error("Missing document content");
+  }
+
+  const preparedPayload = {
+    title: truncate(title, config.maxInputChars && config.maxInputChars.title || 120),
+    url: String(payload.url || "").trim(),
+    goal: truncate(goal, 300),
+    content: truncate(content, config.maxInputChars && config.maxInputChars.documentContent || 12000)
+  };
+
+  if (providerName === "mock") {
+    return buildMockYuqueResult(preparedPayload);
+  }
+
+  const provider = getProviderConfig(config, providerName);
+  validateProvider(providerName, provider);
+
+  const prompt = buildYuquePrompt(preparedPayload);
+  console.log("[llm] analyzeYuqueDoc", {
+    provider: providerName,
+    model: provider.model,
+    title: truncate(preparedPayload.title, 80),
+    goal: truncate(preparedPayload.goal, 80),
+    contentLength: preparedPayload.content.length
+  });
+
+  const result = await callOpenAICompatibleApi({
+    providerName,
+    provider,
+    prompt,
+    timeoutMs: config.requestTimeoutMs || 90000
+  });
+
+  return normalizeYuqueResult(result, providerName, provider.model, preparedPayload);
+}
+
 function validateProvider(providerName, provider) {
   if (!provider.enabled) {
     throw new Error(`Provider "${providerName}" is disabled in server/config.json`);
@@ -228,6 +275,33 @@ function buildTaobaoPrompt(keyword, items) {
   return JSON.stringify(request, null, 2);
 }
 
+function buildYuquePrompt(payload) {
+  const request = {
+    task: "Optimize a Yuque document according to the user's goal.",
+    outputFormat: {
+      summary: [
+        "3 short Chinese sentences"
+      ],
+      changes: [
+        {
+          name: "change name",
+          detail: "brief explanation in Chinese"
+        }
+      ],
+      optimizedContent: "full optimized document content in plain text, preserving headings, lists and code blocks where useful"
+    },
+    rules: [
+      "Follow the optimization goal closely.",
+      "Improve clarity, structure, wording, and completeness when needed.",
+      "Do not output markdown fences around the whole result.",
+      "Return strict JSON only."
+    ],
+    document: payload
+  };
+
+  return JSON.stringify(request, null, 2);
+}
+
 function preparePayload(payload, limits) {
   return {
     title: truncate(payload.title || "", limits.title || 120),
@@ -283,6 +357,39 @@ function normalizeTaobaoResult(result, items, fallback, providerName, model, key
         : "该商品在销量和价格之间更均衡"
     },
     itemCount: items.length
+  };
+}
+
+function normalizeYuqueResult(result, providerName, model, payload) {
+  const optimizedContent = String(
+    result && result.optimizedContent ? result.optimizedContent : ""
+  ).trim();
+
+  if (!optimizedContent) {
+    throw new Error("Model did not return optimizedContent");
+  }
+
+  const changes = Array.isArray(result.changes) ? result.changes.slice(0, 8) : [];
+
+  return {
+    provider: providerName,
+    model,
+    title: payload.title,
+    goal: payload.goal,
+    summary: ensureThreeSummaryLines(Array.isArray(result.summary) ? result.summary : []),
+    changes: changes
+      .map((item) => ({
+        name: String((item && item.name) || "").trim(),
+        detail: String((item && item.detail) || "").trim()
+      }))
+      .filter((item) => item.name || item.detail),
+    functions: changes
+      .map((item) => ({
+        name: String((item && item.name) || "").trim(),
+        detail: String((item && item.detail) || "").trim()
+      }))
+      .filter((item) => item.name || item.detail),
+    optimizedContent
   };
 }
 
@@ -370,6 +477,43 @@ function buildMockTaobaoResult(keyword, items, bestItem, overrideMeta) {
   };
 }
 
+function buildMockYuqueResult(payload) {
+  const original = payload.content || "";
+  const summary = [
+    "已按目标重组文档结构",
+    "表达更集中，步骤更清晰",
+    "已生成可直接回填的优化稿"
+  ];
+
+  const changes = [
+    {
+      name: "结构整理",
+      detail: "把原文按背景、准备和步骤重新组织"
+    },
+    {
+      name: "措辞优化",
+      detail: `已根据“${truncate(payload.goal, 40)}”调整语气和说明方式`
+    }
+  ];
+
+  return {
+    provider: "mock",
+    model: "mock-v1",
+    title: payload.title,
+    goal: payload.goal,
+    summary,
+    changes,
+    functions: changes,
+    optimizedContent: [
+      payload.title ? `# ${payload.title}` : "",
+      "## 优化目标",
+      payload.goal,
+      "## 优化后内容",
+      original
+    ].filter(Boolean).join("\n\n")
+  };
+}
+
 function prepareTaobaoItems(items) {
   return items
     .map((item, index) => ({
@@ -438,5 +582,6 @@ function truncate(value, limit) {
 
 module.exports = {
   analyzePage,
-  analyzeTaobaoItems
+  analyzeTaobaoItems,
+  analyzeYuqueDoc
 };

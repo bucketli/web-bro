@@ -1,5 +1,6 @@
 const API_URL = "http://127.0.0.1:8787/api/summarize-page";
 const TAOBAO_API_URL = "http://127.0.0.1:8787/api/taobao-guide";
+const YUQUE_API_URL = "http://127.0.0.1:8787/api/optimize-yuque";
 const HEALTH_URL = "http://127.0.0.1:8787/health";
 const TAOBAO_SEARCH_URL = "https://s.taobao.com/search";
 const TASK_STORAGE_KEY = "taobaoGuideTask";
@@ -36,6 +37,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "OPTIMIZE_YUQUE_DOC") {
+    optimizeYuqueDoc(message.keyword)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => {
+        sendResponse({ ok: false, error: error.message });
+      });
+    return true;
+  }
+
   if (message.type === "GET_TAOBAO_GUIDE_TASK") {
     getTaskState()
       .then((data) => sendResponse({ ok: true, data }))
@@ -55,18 +65,9 @@ async function checkHealth() {
 }
 
 async function summarizeCurrentTab() {
-  const [tab] = await chrome.tabs.query({
-    active: true,
-    currentWindow: true
-  });
+  const tab = await getCurrentTab();
 
-  if (!tab || !tab.id) {
-    throw new Error("Active tab not found");
-  }
-
-  if (!tab.url || !/^https?:/i.test(tab.url)) {
-    throw new Error("This page does not support content capture");
-  }
+  validatePageTab(tab);
 
   await ensureContentScript(tab.id);
 
@@ -89,6 +90,70 @@ async function summarizeCurrentTab() {
   return response.json();
 }
 
+async function optimizeYuqueDoc(goal) {
+  const normalizedGoal = String(goal || "").trim();
+  if (!normalizedGoal) {
+    throw new Error("请输入优化目标");
+  }
+
+  const tab = await getCurrentTab();
+  validatePageTab(tab);
+  await ensureContentScript(tab.id);
+
+  const docData = await chrome.tabs.sendMessage(tab.id, {
+    type: "COLLECT_YUQUE_DOC"
+  });
+
+  if (docData && docData.ok === false) {
+    throw new Error(docData.error || "读取羽雀文档失败");
+  }
+
+  const response = await fetch(YUQUE_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      ...docData,
+      goal: normalizedGoal
+    })
+  });
+
+  if (!response.ok) {
+    throw await buildHttpError("Yuque optimize request", response);
+  }
+
+  const result = await response.json();
+  const optimizedContent = result &&
+    result.data &&
+    result.data.optimizedContent;
+
+  if (!optimizedContent) {
+    throw new Error("后端未返回优化后的文档内容");
+  }
+
+  const applyResult = await chrome.tabs.sendMessage(tab.id, {
+    type: "APPLY_YUQUE_OPTIMIZED_CONTENT",
+    optimizedContent
+  });
+
+  if (!applyResult || applyResult.ok === false) {
+    throw new Error(
+      applyResult && applyResult.error
+        ? applyResult.error
+        : "羽雀文档回填失败"
+    );
+  }
+
+  return {
+    ...result,
+    data: {
+      ...(result.data || {}),
+      applyResult: applyResult || null
+    }
+  };
+}
+
 async function ensureContentScript(tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, {
@@ -105,6 +170,25 @@ async function ensureContentScript(tabId) {
     target: { tabId },
     files: ["content.js"]
   });
+}
+
+async function getCurrentTab() {
+  const [tab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true
+  });
+
+  if (!tab || !tab.id) {
+    throw new Error("Active tab not found");
+  }
+
+  return tab;
+}
+
+function validatePageTab(tab) {
+  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) {
+    throw new Error("This page does not support content capture");
+  }
 }
 
 async function startTaobaoGuideTask(keyword) {
