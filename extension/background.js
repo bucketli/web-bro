@@ -167,50 +167,49 @@ async function runTaobaoGuide(taskId, normalizedKeyword) {
   });
 
   const allItems = [];
+  const page = 1;
 
   try {
-    for (let page = 1; page <= 3; page += 1) {
-      await setTaskState({
-        id: taskId,
-        status: "running",
-        keyword: normalizedKeyword,
-        message: `正在抓取第 ${page} 页商品...`,
-        itemCount: allItems.length,
-        workerTabId
-      });
+    await setTaskState({
+      id: taskId,
+      status: "running",
+      keyword: normalizedKeyword,
+      message: "正在抓取第 1 页商品...",
+      itemCount: 0,
+      workerTabId
+    });
 
-      const pageUrl = buildTaobaoSearchUrl(normalizedKeyword, page);
-      console.log("[taobao-guide] open search page", {
-        taskId,
-        page,
-        pageUrl
-      });
-      await updateTabAndWait(workerTabId, pageUrl);
-      const currentTab = await chrome.tabs.get(workerTabId);
-      console.log("[taobao-guide] page loaded", {
-        taskId,
-        page,
-        currentUrl: currentTab && currentTab.url ? currentTab.url : ""
-      });
-      await ensureContentScript(workerTabId);
+    const pageUrl = buildTaobaoSearchUrl(normalizedKeyword, page);
+    console.log("[taobao-guide] open search page", {
+      taskId,
+      page,
+      pageUrl
+    });
+    await updateTabAndWait(workerTabId, pageUrl);
+    const currentTab = await chrome.tabs.get(workerTabId);
+    console.log("[taobao-guide] page loaded", {
+      taskId,
+      page,
+      currentUrl: currentTab && currentTab.url ? currentTab.url : ""
+    });
+    await ensureContentScript(workerTabId);
 
-      const pageResult = await chrome.tabs.sendMessage(workerTabId, {
-        type: "COLLECT_TAOBAO_ITEMS",
-        keyword: normalizedKeyword,
-        page
-      });
+    const pageResult = await chrome.tabs.sendMessage(workerTabId, {
+      type: "COLLECT_TAOBAO_ITEMS",
+      keyword: normalizedKeyword,
+      page
+    });
 
-      const items = pageResult && Array.isArray(pageResult.items) ? pageResult.items : [];
-      const debug = pageResult && pageResult.debug ? pageResult.debug : {};
-      console.log("[taobao-guide] collected page items", {
-        taskId,
-        page,
-        count: items.length,
-        selector: debug.selector || "",
-        nodeCount: debug.nodeCount || 0
-      });
-      allItems.push(...items);
-    }
+    const items = pageResult && Array.isArray(pageResult.items) ? pageResult.items : [];
+    const debug = pageResult && pageResult.debug ? pageResult.debug : {};
+    console.log("[taobao-guide] collected page items", {
+      taskId,
+      page,
+      count: items.length,
+      selector: debug.selector || "",
+      nodeCount: debug.nodeCount || 0
+    });
+    allItems.push(...items);
 
     console.log("[taobao-guide] collected total items", {
       taskId,
@@ -226,7 +225,7 @@ async function runTaobaoGuide(taskId, normalizedKeyword) {
       id: taskId,
       status: "running",
       keyword: normalizedKeyword,
-      message: `已抓取 ${allItems.length} 个商品，正在分析...`,
+      message: `已抓取首页 ${allItems.length} 个商品，正在分析...`,
       itemCount: allItems.length,
       workerTabId
     });
