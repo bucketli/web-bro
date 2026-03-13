@@ -148,89 +148,130 @@ async function runTaobaoGuide(taskId, normalizedKeyword) {
     return;
   }
 
-  const [tab] = await chrome.tabs.query({
-    active: true,
-    currentWindow: true
+  const workerTab = await chrome.tabs.create({
+    url: buildTaobaoSearchUrl(normalizedKeyword, 1),
+    active: false
   });
 
-  if (!tab || !tab.id) {
-    throw new Error("Active tab not found");
+  if (!workerTab || !workerTab.id) {
+    throw new Error("Failed to create Taobao worker tab");
   }
 
-  const allItems = [];
-
-  for (let page = 1; page <= 3; page += 1) {
-    await setTaskState({
-      id: taskId,
-      status: "running",
-      keyword: normalizedKeyword,
-      message: `正在抓取第 ${page} 页商品...`,
-      itemCount: allItems.length
-    });
-
-    const pageUrl = buildTaobaoSearchUrl(normalizedKeyword, page);
-    await chrome.tabs.update(tab.id, { url: pageUrl });
-    await waitForTabComplete(tab.id);
-    await ensureContentScript(tab.id);
-
-    const pageResult = await chrome.tabs.sendMessage(tab.id, {
-      type: "COLLECT_TAOBAO_ITEMS",
-      keyword: normalizedKeyword,
-      page
-    });
-
-    const items = pageResult && Array.isArray(pageResult.items) ? pageResult.items : [];
-    allItems.push(...items);
-  }
-
-  if (!allItems.length) {
-    throw new Error("未抓取到淘宝商品列表");
-  }
-
+  const workerTabId = workerTab.id;
   await setTaskState({
     id: taskId,
     status: "running",
     keyword: normalizedKeyword,
-    message: `已抓取 ${allItems.length} 个商品，正在分析...`,
-    itemCount: allItems.length
+    message: "已创建淘宝后台标签页",
+    workerTabId
   });
 
-  const response = await fetch(TAOBAO_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
+  const allItems = [];
+
+  try {
+    for (let page = 1; page <= 3; page += 1) {
+      await setTaskState({
+        id: taskId,
+        status: "running",
+        keyword: normalizedKeyword,
+        message: `正在抓取第 ${page} 页商品...`,
+        itemCount: allItems.length,
+        workerTabId
+      });
+
+      const pageUrl = buildTaobaoSearchUrl(normalizedKeyword, page);
+      await chrome.tabs.update(workerTabId, { url: pageUrl });
+      await waitForTabComplete(workerTabId);
+      await ensureContentScript(workerTabId);
+
+      const pageResult = await chrome.tabs.sendMessage(workerTabId, {
+        type: "COLLECT_TAOBAO_ITEMS",
+        keyword: normalizedKeyword,
+        page
+      });
+
+      const items = pageResult && Array.isArray(pageResult.items) ? pageResult.items : [];
+      const debug = pageResult && pageResult.debug ? pageResult.debug : {};
+      console.log("[taobao-guide] collected page items", {
+        taskId,
+        page,
+        count: items.length,
+        selector: debug.selector || "",
+        nodeCount: debug.nodeCount || 0
+      });
+      allItems.push(...items);
+    }
+
+    console.log("[taobao-guide] collected total items", {
+      taskId,
       keyword: normalizedKeyword,
-      items: allItems
-    })
-  });
+      count: allItems.length
+    });
 
-  if (!response.ok) {
-    throw await buildHttpError("Taobao guide request", response);
+    if (!allItems.length) {
+      throw new Error("未抓取到淘宝商品列表");
+    }
+
+    await setTaskState({
+      id: taskId,
+      status: "running",
+      keyword: normalizedKeyword,
+      message: `已抓取 ${allItems.length} 个商品，正在分析...`,
+      itemCount: allItems.length,
+      workerTabId
+    });
+
+    const response = await fetch(TAOBAO_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        keyword: normalizedKeyword,
+        items: allItems
+      })
+    });
+
+    if (!response.ok) {
+      throw await buildHttpError("Taobao guide request", response);
+    }
+
+    const result = await response.json();
+    const bestItem = result &&
+      result.data &&
+      result.data.bestItem;
+
+    await setTaskState({
+      id: taskId,
+      status: "completed",
+      keyword: normalizedKeyword,
+      message: "已完成淘宝导购分析",
+      finishedAt: new Date().toISOString(),
+      itemCount: allItems.length,
+      result: result.data || null,
+      error: "",
+      workerTabId
+    });
+
+    if (bestItem && bestItem.link) {
+      await chrome.tabs.create({
+        url: bestItem.link,
+        active: true
+      });
+    }
+
+    return result;
+  } finally {
+    try {
+      await chrome.tabs.remove(workerTabId);
+    } catch (error) {
+      console.log("[taobao-guide] worker tab cleanup skipped", {
+        taskId,
+        workerTabId,
+        message: error && error.message ? error.message : String(error)
+      });
+    }
   }
-
-  const result = await response.json();
-  const bestItem = result &&
-    result.data &&
-    result.data.bestItem;
-
-  await setTaskState({
-    id: taskId,
-    status: "completed",
-    keyword: normalizedKeyword,
-    message: "已完成淘宝导购分析",
-    finishedAt: new Date().toISOString(),
-    itemCount: allItems.length,
-    result: result.data || null,
-    error: ""
-  });
-
-  if (bestItem && bestItem.link) {
-    await chrome.tabs.update(tab.id, { url: bestItem.link });
-  }
-
-  return result;
 }
 
 function waitForTabComplete(tabId) {

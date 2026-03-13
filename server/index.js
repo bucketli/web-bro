@@ -85,6 +85,11 @@ app.post("/api/taobao-guide", async (req, res) => {
       : "";
 
   try {
+    console.log("[taobao-guide] analyze request", {
+      keyword: payload.keyword || "",
+      itemCount: Array.isArray(payload.items) ? payload.items.length : 0
+    });
+
     const config = loadConfig();
     const result = await analyzeTaobaoItems(payload, config, providerOverride);
 
