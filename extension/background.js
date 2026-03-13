@@ -202,13 +202,14 @@ async function runTaobaoGuide(taskId, normalizedKeyword) {
 
     const items = pageResult && Array.isArray(pageResult.items) ? pageResult.items : [];
     const debug = pageResult && pageResult.debug ? pageResult.debug : {};
-    console.log("[taobao-guide] collected page items", {
-      taskId,
-      page,
-      count: items.length,
-      selector: debug.selector || "",
-      nodeCount: debug.nodeCount || 0
-    });
+      console.log("[taobao-guide] collected page items", {
+        taskId,
+        page,
+        count: items.length,
+        selector: debug.selector || "",
+        nodeCount: debug.nodeCount || 0,
+        sampleTitles: Array.isArray(debug.sampleTitles) ? debug.sampleTitles : []
+      });
     allItems.push(...items);
 
     console.log("[taobao-guide] collected total items", {

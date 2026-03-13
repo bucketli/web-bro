@@ -224,7 +224,8 @@ async function collectTaobaoItems(page) {
       page,
       selector: lookup.selector,
       nodeCount: lookup.nodes.length,
-      itemCount: items.length
+      itemCount: items.length,
+      sampleTitles: items.slice(0, 3).map((item) => item.title)
     }
   };
 }
@@ -304,6 +305,39 @@ function findTaobaoItemNodes() {
 }
 
 function findTaobaoItemNodesWithSelector() {
+  const primarySelectors = [
+    "a.doubleCardWrapperAdapt--mEcC7olq",
+    'a[id^="item_id_"]',
+    'a[href*="item.taobao.com/item.htm"][id^="item_id_"]',
+    'a[href*="detail.tmall.com/item.htm"][id^="item_id_"]'
+  ];
+
+  for (const selector of primarySelectors) {
+    const nodes = Array.from(document.querySelectorAll(selector));
+    if (nodes.length >= 3) {
+      return {
+        selector,
+        nodes
+      };
+    }
+  }
+
+  const linkAnchors = findTaobaoItemAnchors();
+  if (linkAnchors.length) {
+    const nodes = dedupeNodes(
+      linkAnchors
+        .map((anchor) => findProductContainer(anchor))
+        .filter(Boolean)
+    );
+
+    if (nodes.length) {
+      return {
+        selector: "heuristic:item-link-container",
+        nodes
+      };
+    }
+  }
+
   const selectors = [
     '[data-id][class*="doubleCardWrapper"]',
     '[data-id][class*="Card--"]',
@@ -329,17 +363,12 @@ function findTaobaoItemNodesWithSelector() {
 }
 
 function parseTaobaoItem(node, page) {
-  const titleEl = node.querySelector('a[title], img[alt], [class*="title"], .title');
-  const linkEl = node.querySelector('a[href*="item.taobao.com"], a[href*="detail.tmall.com"], a[href]');
-  const priceEl = node.querySelector('[class*="price"], .price, .Price--priceInt--, .Price--priceFloat--');
-  const soldEl = node.querySelector('[class*="realSales"], [class*="sales"], .deal-cnt, .sale, [class*="payCnt"]');
-  const shopEl = node.querySelector('[class*="shopName"], .shopname, .shop, [class*="seller"] a, [class*="shop"] a');
-
-  const title = extractText(titleEl) || extractAttr(titleEl, "alt");
+  const linkEl = findProductAnchorInNode(node);
+  const title = extractTaobaoTitle(node, linkEl);
   const link = normalizeTaobaoLink(linkEl ? linkEl.getAttribute("href") : "");
-  const priceText = normalizePriceText(priceEl ? priceEl.textContent : "");
-  const soldText = normalizeWhitespace(soldEl ? soldEl.textContent : "");
-  const shop = normalizeWhitespace(shopEl ? shopEl.textContent : "");
+  const priceText = extractPriceText(node);
+  const soldText = extractSoldText(node);
+  const shop = extractShopText(node);
 
   return {
     page,
@@ -351,6 +380,169 @@ function parseTaobaoItem(node, page) {
     shop,
     link
   };
+}
+
+function findTaobaoItemAnchors() {
+  const selectors = [
+    'a[href*="item.taobao.com/item.htm"]',
+    'a[href*="detail.tmall.com/item.htm"]',
+    'a[href*="//item.taobao.com/"]',
+    'a[href*="//detail.tmall.com/"]'
+  ];
+
+  const anchors = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+  return dedupeNodes(
+    anchors.filter((anchor) => anchor instanceof HTMLAnchorElement)
+  );
+}
+
+function findProductContainer(anchor) {
+  let current = anchor;
+
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    if (looksLikeProductContainer(current)) {
+      return current;
+    }
+    current = current.parentElement;
+  }
+
+  return anchor.parentElement || anchor;
+}
+
+function looksLikeProductContainer(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  const text = normalizeWhitespace(element.innerText || "");
+  const hasLink = Boolean(findProductAnchorInNode(element));
+  const hasPrice = /\d+(?:\.\d+)?/.test(extractPriceText(element));
+  const hasSold = /(付款|已售|人购买|人付款|销量)/.test(text);
+
+  return hasLink && (hasPrice || hasSold) && text.length >= 20;
+}
+
+function findProductAnchorInNode(node) {
+  if (!node || !(node instanceof HTMLElement)) {
+    return null;
+  }
+
+  if (node instanceof HTMLAnchorElement && node.href) {
+    return node;
+  }
+
+  return node.querySelector(
+    'a[href*="item.taobao.com/item.htm"], a[href*="detail.tmall.com/item.htm"], a[href*="//item.taobao.com/"], a[href*="//detail.tmall.com/"]'
+  );
+}
+
+function extractPriceText(node) {
+  const priceIntEl = node.querySelector(".priceInt--yqqZMJ5a");
+  const priceFloatEl = node.querySelector(".priceFloat--XpixvyQ1");
+  if (priceIntEl) {
+    const intPart = normalizeWhitespace(priceIntEl.textContent || "");
+    const floatPart = normalizeWhitespace(priceFloatEl ? priceFloatEl.textContent : "");
+    return `${intPart}${floatPart || ""}`;
+  }
+
+  const explicit = node.querySelector(
+    '[class*="price"], .price, .Price--priceInt--, .Price--priceFloat--, strong'
+  );
+  const explicitText = normalizePriceText(explicit ? explicit.textContent : "");
+  if (explicitText) {
+    return explicitText;
+  }
+
+  const text = normalizeWhitespace(node.innerText || "");
+  const matches = text.match(/\d+(?:\.\d{1,2})?/g) || [];
+  const candidate = matches.find((value) => value.includes(".") || Number(value) >= 10);
+  return candidate || "";
+}
+
+function extractSoldText(node) {
+  const soldEl = node.querySelector(".realSales--XZJiepmt");
+  if (soldEl) {
+    return normalizeWhitespace(soldEl.textContent || "");
+  }
+
+  const explicit = node.querySelector(
+    '[class*="realSales"], [class*="sales"], .deal-cnt, .sale, [class*="payCnt"]'
+  );
+  const explicitText = normalizeWhitespace(explicit ? explicit.textContent : "");
+  if (explicitText) {
+    return explicitText;
+  }
+
+  const text = normalizeWhitespace(node.innerText || "");
+  const match = text.match(/(\d+(?:\.\d+)?万?)[^\n]{0,8}(付款|已售|人购买|人付款|销量)/);
+  return match ? match[0] : "";
+}
+
+function extractShopText(node) {
+  const shopTextNodes = Array.from(node.querySelectorAll(".shopNameText--DmtlsDKm"));
+  if (shopTextNodes.length) {
+    const lastShopName = normalizeWhitespace(shopTextNodes[shopTextNodes.length - 1].textContent || "");
+    if (lastShopName) {
+      return lastShopName;
+    }
+  }
+
+  const explicit = node.querySelector(
+    '[class*="shopName"], .shopname, .shop, [class*="seller"] a, [class*="shop"] a'
+  );
+  const explicitText = normalizeWhitespace(explicit ? explicit.textContent : "");
+  if (explicitText) {
+    return explicitText;
+  }
+
+  const links = Array.from(node.querySelectorAll("a"));
+  const matched = links
+    .map((link) => normalizeWhitespace(link.textContent || ""))
+    .find((text) => /(旗舰店|专卖店|企业店|小店|店铺|天猫)/.test(text));
+
+  return matched || "";
+}
+
+function extractTaobaoTitle(node, linkEl) {
+  const titleEl = node.querySelector(".title--ASSt27UY");
+  const title = normalizeWhitespace(
+    extractAttr(titleEl, "title") ||
+      extractText(titleEl)
+  );
+
+  if (title) {
+    return title;
+  }
+
+  const fallbackEl = node.querySelector('a[title], img[alt], [class*="title"], .title, h3, h4');
+  return normalizeWhitespace(
+    extractAttr(fallbackEl, "title") ||
+      extractText(fallbackEl) ||
+      extractAttr(fallbackEl, "alt") ||
+      extractAttr(linkEl, "title") ||
+      extractText(linkEl)
+  );
+}
+
+function dedupeNodes(nodes) {
+  const seen = new Set();
+  const result = [];
+
+  nodes.forEach((node) => {
+    if (!node) {
+      return;
+    }
+
+    const key = node.outerHTML ? node.outerHTML.slice(0, 300) : String(node);
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    result.push(node);
+  });
+
+  return result;
 }
 
 function extractText(element) {
