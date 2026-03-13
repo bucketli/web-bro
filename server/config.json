@@ -1,0 +1,29 @@
+{
+  "defaultProvider": "qwen",
+  "requestTimeoutMs": 90000,
+  "maxInputChars": {
+    "text": 400,
+    "htmlSnippet": 600,
+    "interactiveHtml": 2400,
+    "metaDescription": 300,
+    "firstH1": 120,
+    "title": 120
+  },
+  "providers": {
+    "mock": {
+      "enabled": false
+    },
+    "openai": {
+      "enabled": false,
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "YOUR_OPENAI_API_KEY",
+      "model": "gpt-4.1-mini"
+    },
+    "qwen": {
+      "enabled": true,
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "sk-100a0231eed24530bc40206b6b68bf38",
+      "model": "qwen3.5-plus"
+    }
+  }
+}

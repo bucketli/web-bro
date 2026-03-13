@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Page Summarizer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <h1>网页助手</h1>
+      <div class="status-row">
+        <span>服务状态</span>
+        <span id="service-status" class="status pending">检查中</span>
+      </div>
+      <section class="feature-section">
+        <h2>选择功能</h2>
+        <div id="feature-list" class="feature-list"></div>
+      </section>
+      <section id="feature-input-section" class="input-section hidden">
+        <label class="input-label" for="feature-input">商品名称</label>
+        <input id="feature-input" class="feature-input" type="text" placeholder="例如：机械键盘" />
+      </section>
+      <button id="action-button" type="button">执行当前功能</button>
+      <section id="best-item-section" class="result-section hidden">
+        <h2>推荐商品</h2>
+        <div id="best-item-card" class="best-item-card"></div>
+      </section>
+      <section class="result-section">
+        <h2 id="summary-title">三句总结</h2>
+        <ol id="summary-list" class="summary-list">
+          <li>暂无结果</li>
+        </ol>
+      </section>
+      <section class="result-section">
+        <h2 id="functions-title">页面功能</h2>
+        <ul id="functions-list" class="functions-list">
+          <li class="empty-item">暂无结果</li>
+        </ul>
+      </section>
+      <p id="message" class="message"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
