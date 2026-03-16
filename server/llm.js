@@ -94,12 +94,13 @@ async function analyzeYuqueDoc(payload, config, providerOverride) {
   const goal = String(payload.goal || "").trim();
   const title = String(payload.title || "").trim();
   const content = String(payload.content || "").trim();
+  const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
 
   if (!goal) {
     throw new Error("Missing goal");
   }
 
-  if (!content) {
+  if (!content || !nodes.length) {
     throw new Error("Missing document content");
   }
 
@@ -107,7 +108,14 @@ async function analyzeYuqueDoc(payload, config, providerOverride) {
     title: truncate(title, config.maxInputChars && config.maxInputChars.title || 120),
     url: String(payload.url || "").trim(),
     goal: truncate(goal, 300),
-    content: truncate(content, config.maxInputChars && config.maxInputChars.documentContent || 12000)
+    content: truncate(content, config.maxInputChars && config.maxInputChars.documentContent || 12000),
+    nodes: nodes
+      .map((node) => ({
+        id: String(node.id || "").trim(),
+        text: truncate(String(node.text || "").trim(), 300),
+        context: node.context || {}
+      }))
+      .filter((node) => node.id && node.text)
   };
 
   if (providerName === "mock") {
@@ -123,7 +131,8 @@ async function analyzeYuqueDoc(payload, config, providerOverride) {
     model: provider.model,
     title: truncate(preparedPayload.title, 80),
     goal: truncate(preparedPayload.goal, 80),
-    contentLength: preparedPayload.content.length
+    contentLength: preparedPayload.content.length,
+    nodeCount: preparedPayload.nodes.length
   });
 
   const result = await callOpenAICompatibleApi({
@@ -197,7 +206,11 @@ async function callOpenAICompatibleApi({ providerName, provider, prompt, timeout
       throw new Error(`No model content returned from provider "${providerName}"`);
     }
 
-    return parseModelJson(content);
+    try {
+      return parseModelJson(content);
+    } catch (error) {
+      throw new Error(`${error.message} | Model content preview: ${truncate(content, 500)}`);
+    }
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(`${providerName} API request timed out`);
@@ -277,7 +290,7 @@ function buildTaobaoPrompt(keyword, items) {
 
 function buildYuquePrompt(payload) {
   const request = {
-    task: "Optimize a Yuque document according to the user's goal.",
+    task: "Optimize text nodes in a Yuque Lake document according to the user's goal.",
     outputFormat: {
       summary: [
         "3 short Chinese sentences"
@@ -288,15 +301,28 @@ function buildYuquePrompt(payload) {
           detail: "brief explanation in Chinese"
         }
       ],
-      optimizedContent: "full optimized document content in plain text, preserving headings, lists and code blocks where useful"
+      replacements: [
+        {
+          id: "node id",
+          text: "optimized text for this node"
+        }
+      ]
     },
     rules: [
       "Follow the optimization goal closely.",
-      "Improve clarity, structure, wording, and completeness when needed.",
-      "Do not output markdown fences around the whole result.",
+      "Only rewrite plain text nodes provided in the nodes array.",
+      "Do not invent new nodes, do not remove ids, do not change code commands, code snippets, product names, version numbers, URLs, or table structure unless the text node itself clearly needs wording improvement.",
+      "Preserve technical meaning and formatting intent.",
+      "Return only the nodes that should actually change.",
       "Return strict JSON only."
     ],
-    document: payload
+    document: {
+      title: payload.title,
+      url: payload.url,
+      goal: payload.goal,
+      contentPreview: payload.content,
+      nodes: payload.nodes
+    }
   };
 
   return JSON.stringify(request, null, 2);
@@ -332,7 +358,18 @@ function normalizeModelResult(content) {
 
 function parseModelJson(content) {
   const jsonText = extractJson(content);
-  return JSON.parse(jsonText);
+  try {
+    return JSON.parse(jsonText);
+  } catch (error) {
+    const repaired = repairJsonText(jsonText);
+    try {
+      return JSON.parse(repaired);
+    } catch (repairError) {
+      throw new Error(
+        `Failed to parse model JSON: ${repairError.message}. Raw: ${truncate(jsonText, 500)}`
+      );
+    }
+  }
 }
 
 function normalizeTaobaoResult(result, items, fallback, providerName, model, keyword) {
@@ -361,15 +398,12 @@ function normalizeTaobaoResult(result, items, fallback, providerName, model, key
 }
 
 function normalizeYuqueResult(result, providerName, model, payload) {
-  const optimizedContent = String(
-    result && result.optimizedContent ? result.optimizedContent : ""
-  ).trim();
-
-  if (!optimizedContent) {
-    throw new Error("Model did not return optimizedContent");
-  }
-
   const changes = Array.isArray(result.changes) ? result.changes.slice(0, 8) : [];
+  const replacements = normalizeYuqueReplacements(result && result.replacements, payload.nodes);
+
+  if (!replacements.length) {
+    throw new Error("Model did not return valid replacements");
+  }
 
   return {
     provider: providerName,
@@ -389,8 +423,24 @@ function normalizeYuqueResult(result, providerName, model, payload) {
         detail: String((item && item.detail) || "").trim()
       }))
       .filter((item) => item.name || item.detail),
-    optimizedContent
+    replacements
   };
+}
+
+function normalizeYuqueReplacements(replacements, nodes) {
+  if (!Array.isArray(replacements)) {
+    return [];
+  }
+
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  return replacements
+    .map((item) => ({
+      id: String((item && item.id) || "").trim(),
+      text: String((item && item.text) || "").trim()
+    }))
+    .filter((item) => item.id && item.text && nodeMap.has(item.id))
+    .filter((item) => item.text !== nodeMap.get(item.id).text)
+    .slice(0, nodes.length);
 }
 
 function ensureThreeSummaryLines(summary) {
@@ -414,17 +464,76 @@ function ensureThreeSummaryLines(summary) {
 
 function extractJson(content) {
   const trimmed = String(content || "").trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
 
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    return trimmed;
+  if (
+    (candidate.startsWith("{") && candidate.endsWith("}")) ||
+    (candidate.startsWith("[") && candidate.endsWith("]"))
+  ) {
+    return candidate;
   }
 
-  const match = trimmed.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error(`Model response does not contain valid JSON: ${truncate(trimmed, 400)}`);
+  const objectMatch = findBalancedJson(candidate, "{", "}");
+  if (objectMatch) {
+    return objectMatch;
   }
 
-  return match[0];
+  const arrayMatch = findBalancedJson(candidate, "[", "]");
+  if (arrayMatch) {
+    return arrayMatch;
+  }
+
+  throw new Error(`Model response does not contain valid JSON: ${truncate(candidate, 400)}`);
+}
+
+function findBalancedJson(text, openChar, closeChar) {
+  const start = text.indexOf(openChar);
+  if (start < 0) {
+    return "";
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === openChar) {
+      depth += 1;
+    } else if (char === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return "";
+}
+
+function repairJsonText(text) {
+  return String(text || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
 }
 
 function buildMockResult(payload) {
@@ -478,11 +587,10 @@ function buildMockTaobaoResult(keyword, items, bestItem, overrideMeta) {
 }
 
 function buildMockYuqueResult(payload) {
-  const original = payload.content || "";
   const summary = [
     "已按目标重组文档结构",
     "表达更集中，步骤更清晰",
-    "已生成可直接回填的优化稿"
+    "已生成节点级优化结果"
   ];
 
   const changes = [
@@ -504,13 +612,10 @@ function buildMockYuqueResult(payload) {
     summary,
     changes,
     functions: changes,
-    optimizedContent: [
-      payload.title ? `# ${payload.title}` : "",
-      "## 优化目标",
-      payload.goal,
-      "## 优化后内容",
-      original
-    ].filter(Boolean).join("\n\n")
+    replacements: payload.nodes.slice(0, 4).map((node) => ({
+      id: node.id,
+      text: node.text
+    }))
   };
 }
 

@@ -124,17 +124,18 @@ async function optimizeYuqueDoc(goal) {
   }
 
   const result = await response.json();
-  const optimizedContent = result &&
-    result.data &&
-    result.data.optimizedContent;
+  const optimizeResult = result && result.data ? result.data : null;
+  const replacements = optimizeResult && Array.isArray(optimizeResult.replacements)
+    ? optimizeResult.replacements
+    : [];
 
-  if (!optimizedContent) {
-    throw new Error("后端未返回优化后的文档内容");
+  if (!replacements.length) {
+    throw new Error("后端未返回可应用的文本替换结果");
   }
 
   const applyResult = await chrome.tabs.sendMessage(tab.id, {
     type: "APPLY_YUQUE_OPTIMIZED_CONTENT",
-    optimizedContent
+    optimizeResult
   });
 
   if (!applyResult || applyResult.ok === false) {
@@ -148,7 +149,7 @@ async function optimizeYuqueDoc(goal) {
   return {
     ...result,
     data: {
-      ...(result.data || {}),
+      ...(optimizeResult || {}),
       applyResult: applyResult || null
     }
   };

@@ -125,7 +125,8 @@ app.post("/api/optimize-yuque", async (req, res) => {
     console.log("[optimize-yuque] analyze request", {
       title: payload.title || "",
       goal: payload.goal || "",
-      contentLength: String(payload.content || "").length
+      contentLength: String(payload.content || "").length,
+      contentPreview: truncateForLog(payload.content || "", 600)
     });
 
     const config = loadConfig();
@@ -142,7 +143,8 @@ app.post("/api/optimize-yuque", async (req, res) => {
       providerOverride: providerOverride || "",
       title: payload.title || "",
       goal: payload.goal || "",
-      contentLength: String(payload.content || "").length
+      contentLength: String(payload.content || "").length,
+      contentPreview: truncateForLog(payload.content || "", 600)
     });
 
     res.status(500).json({
@@ -167,4 +169,12 @@ function summarizeProviders(providers) {
       }
     ])
   );
+}
+
+function truncateForLog(value, limit) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit)}...`;
 }

@@ -18,16 +18,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "COLLECT_YUQUE_DOC") {
-    try {
-      sendResponse(collectYuqueDoc());
-    } catch (error) {
-      sendResponse({ ok: false, error: error.message });
-    }
-    return false;
+    collectYuqueDoc()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
   }
 
   if (message.type === "APPLY_YUQUE_OPTIMIZED_CONTENT") {
-    applyYuqueOptimizedContent(message.optimizedContent)
+    applyYuqueOptimizedContent(message.optimizeResult)
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -75,16 +73,19 @@ function collectPageData() {
   };
 }
 
-function collectYuqueDoc() {
+async function collectYuqueDoc() {
   if (!isYuquePage()) {
     throw new Error("当前页面不是羽雀文档页");
   }
 
   const titleInput = document.querySelector('textarea[data-testid="input"]');
-  const titleNode = document.querySelector(".index-module_title_e9d9E");
+  const titleNode =
+    document.querySelector("#article-title") ||
+    document.querySelector(".index-module_title_e9d9E");
   const editorRoot =
-    document.querySelector(".ne-engine") ||
-    document.querySelector("#doc-reader-content .ne-engine") ||
+    document.querySelector("#doc-reader-content article#content .ne-viewer-body") ||
+    document.querySelector("#doc-reader-content .ne-viewer-body") ||
+    document.querySelector("#lark-text-editor .ne-engine[contenteditable='true']") ||
     document.querySelector("#doc-reader-content");
 
   if (!editorRoot) {
@@ -98,20 +99,88 @@ function collectYuqueDoc() {
         ? titleNode.textContent
         : document.title
   );
-  const content = extractYuqueText(editorRoot);
+  const nodes = extractYuqueTextNodes(editorRoot);
+  const content = nodes.map((node) => node.text).join("\n");
 
-  if (!content) {
+  if (!content || !nodes.length) {
     throw new Error("未读取到羽雀文档正文");
   }
 
+  const context = detectYuqueContext();
+  if (!context.docId) {
+    throw new Error("未能识别羽雀文档 docId");
+  }
+
   return {
+    ok: true,
     title,
     url: window.location.href,
-    goal: "",
     content,
-    isEditMode: isYuqueEditMode(),
+    docId: context.docId,
+    csrfToken: context.csrfToken,
+    login: context.login,
+    nodes,
     capturedAt: new Date().toISOString()
   };
+}
+
+function detectYuqueContext() {
+  return {
+    docId: detectYuqueDocId(),
+    csrfToken: detectYuqueCsrfToken(),
+    login: detectYuqueLogin()
+  };
+}
+
+function detectYuqueDocId() {
+  const resourceEntries = performance.getEntriesByType("resource");
+  for (const entry of resourceEntries) {
+    const match = String(entry && entry.name).match(/\/api\/docs\/(\d+)\/content(?:[/?#]|$)/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  const html = document.documentElement.innerHTML.slice(0, 200000);
+  const htmlMatch = html.match(/\/api\/docs\/(\d+)\/content/g);
+  if (htmlMatch && htmlMatch.length) {
+    const last = htmlMatch[htmlMatch.length - 1].match(/(\d+)/);
+    if (last) {
+      return last[1];
+    }
+  }
+
+  return "";
+}
+
+function detectYuqueCsrfToken() {
+  const cookieToken = readCookie("_csrf_token") || readCookie("csrf_token") || readCookie("CSRF-TOKEN");
+  if (cookieToken) {
+    return cookieToken;
+  }
+
+  const meta =
+    document.querySelector('meta[name="csrf-token"]') ||
+    document.querySelector('meta[name="x-csrf-token"]');
+  return meta ? String(meta.getAttribute("content") || "").trim() : "";
+}
+
+function detectYuqueLogin() {
+  const parts = window.location.pathname.split("/").filter(Boolean);
+  return parts.length ? parts[0] : "";
+}
+
+function readCookie(name) {
+  const prefix = `${name}=`;
+  const entries = String(document.cookie || "").split(";");
+  for (const entry of entries) {
+    const trimmed = entry.trim();
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    }
+  }
+
+  return "";
 }
 
 function extractVisibleText(root) {
@@ -131,14 +200,27 @@ function extractVisibleText(root) {
 }
 
 function extractYuqueText(root) {
-  const blocks = Array.from(
-    root.querySelectorAll(
-      "ne-h1, ne-h2, ne-h3, ne-h4, ne-p, ne-oli, ne-tli, ne-table-hole, ne-hole[data-card='codeblock']"
-    )
-  );
+  const blocks = Array.from(root.children).filter((node) => {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+
+    const tagName = node.tagName.toLowerCase();
+    return [
+      "ne-h1",
+      "ne-h2",
+      "ne-h3",
+      "ne-h4",
+      "ne-p",
+      "ne-oli",
+      "ne-tli",
+      "ne-table-hole",
+      "ne-hole"
+    ].includes(tagName);
+  });
 
   if (!blocks.length) {
-    return normalizeWhitespace(root.innerText || root.textContent || "");
+    return collectNeText(root);
   }
 
   const lines = blocks
@@ -148,9 +230,21 @@ function extractYuqueText(root) {
   return lines.join("\n\n").trim();
 }
 
+function extractYuqueTextNodes(root) {
+  return Array.from(root.querySelectorAll("ne-text[id]"))
+    .filter((node) => !shouldSkipYuqueTextNode(node))
+    .map((node, index) => ({
+      id: node.id,
+      text: normalizeWhitespace(node.textContent || ""),
+      index,
+      context: buildYuqueNodeContext(node)
+    }))
+    .filter((node) => node.id && node.text);
+}
+
 function formatYuqueBlock(block) {
   const tagName = block.tagName ? block.tagName.toLowerCase() : "";
-  const text = normalizeWhitespace(block.innerText || block.textContent || "");
+  const text = getBlockText(block);
   if (!text) {
     return "";
   }
@@ -182,10 +276,88 @@ function formatYuqueBlock(block) {
   }
 
   if (tagName === "ne-hole") {
-    return `\`\`\`\n${text}\n\`\`\``;
+    return `\`\`\`\n${getCodeBlockText(block) || text}\n\`\`\``;
+  }
+
+  if (tagName === "ne-table-hole") {
+    return getTableText(block) || text;
   }
 
   return text;
+}
+
+function getBlockText(block) {
+  const tagName = block.tagName ? block.tagName.toLowerCase() : "";
+
+  if (tagName === "ne-table-hole") {
+    return getTableText(block);
+  }
+
+  if (tagName === "ne-hole") {
+    return getCodeBlockText(block) || collectNeText(block);
+  }
+
+  return collectNeText(block);
+}
+
+function collectNeText(root) {
+  const texts = Array.from(root.querySelectorAll("ne-text"))
+    .map((node) => normalizeWhitespace(node.textContent || ""))
+    .filter(Boolean);
+
+  if (texts.length) {
+    return texts.join(" ");
+  }
+
+  return normalizeWhitespace(root.textContent || "");
+}
+
+function buildYuqueNodeContext(node) {
+  const parent = node.parentElement;
+  const block = node.closest("ne-h1, ne-h2, ne-h3, ne-h4, ne-p, ne-oli, ne-uli, td, th");
+  return {
+    parentTag: parent ? parent.tagName.toLowerCase() : "",
+    blockTag: block ? block.tagName.toLowerCase() : "",
+    inTable: Boolean(node.closest("table")),
+    inList: Boolean(node.closest("ne-oli, ne-uli")),
+    inHeading: Boolean(node.closest("ne-h1, ne-h2, ne-h3, ne-h4"))
+  };
+}
+
+function shouldSkipYuqueTextNode(node) {
+  return Boolean(
+    node.closest("ne-code") ||
+    node.closest("card") ||
+    node.closest("pre") ||
+    node.closest(".ne-codeblock") ||
+    node.closest("ne-hole")
+  );
+}
+
+function getCodeBlockText(block) {
+  const lines = Array.from(block.querySelectorAll(".cm-line"))
+    .map((node) => String(node.textContent || "").replace(/\u200b/g, "").trimEnd())
+    .filter((line) => line.trim());
+
+  return lines.join("\n").trim();
+}
+
+function getTableText(block) {
+  const rows = Array.from(block.querySelectorAll("table .ne-tr"))
+    .map((row) => {
+      const cells = Array.from(row.querySelectorAll(".ne-td"))
+        .map((cell) => collectNeText(cell))
+        .filter(Boolean);
+
+      if (!cells.length) {
+        return "";
+      }
+
+      return `| ${cells.join(" | ")} |`;
+    })
+    .filter(Boolean);
+
+  return rows.join("\n").trim();
 }
 
 function cleanHtml(html) {
@@ -280,33 +452,43 @@ function truncate(value, limit) {
   return `${value.slice(0, limit)}...`;
 }
 
-async function applyYuqueOptimizedContent(optimizedContent) {
-  const normalizedContent = String(optimizedContent || "").trim();
-  if (!normalizedContent) {
-    throw new Error("缺少优化后的文档内容");
+async function applyYuqueOptimizedContent(optimizeResult) {
+  const replacements = optimizeResult && Array.isArray(optimizeResult.replacements)
+    ? optimizeResult.replacements
+    : [];
+
+  if (!replacements.length) {
+    throw new Error("缺少优化后的文本替换结果");
   }
 
   if (!isYuquePage()) {
     throw new Error("当前页面不是羽雀文档页");
   }
 
-  await ensureYuqueEditMode();
+  const context = optimizeResult && optimizeResult.context
+    ? optimizeResult.context
+    : detectYuqueContext();
 
-  const editor = await waitForElement([".ne-engine[contenteditable='true']", ".ne-engine"]);
-  replaceEditorContent(editor, normalizedContent);
+  if (!context || !context.docId) {
+    throw new Error("未找到羽雀文档 ID");
+  }
 
-  await wait(400);
+  const currentContent = await fetchYuqueContent(context);
+  const updatedBodyAsl = applyTextReplacementsToMarkup(currentContent.body_asl, replacements);
+  const updatedBodyHtml = applyTextReplacementsToMarkup(currentContent.body_html, replacements);
 
-  const publishButton = await waitForElement([
-    "#lake-doc-publish-button",
-    '[data-testid="PublishButton:doc-publish-button"]'
-  ]);
+  await saveYuqueContent(context, {
+    ...currentContent,
+    body_asl: updatedBodyAsl,
+    body_html: updatedBodyHtml
+  });
 
-  publishButton.click();
+  const publishResult = await publishYuqueDoc(context);
 
   return {
     ok: true,
-    updated: true
+    updated: true,
+    published: publishResult.ok
   };
 }
 
@@ -424,54 +606,11 @@ async function ensureYuqueEditMode() {
   }
 
   editButton.click();
-  await waitForElement([".ne-engine[contenteditable='true']", ".lakex-editor-wrapper"], 15000);
-}
-
-function findYuqueEditButton() {
-  const candidates = Array.from(
-    document.querySelectorAll("button, a, [role='button'], .ant-btn, span")
-  );
-
-  return candidates.find((element) => {
-    if (!(element instanceof HTMLElement)) {
-      return false;
-    }
-
-    const text = normalizeWhitespace(element.innerText || element.textContent || "");
-    if (text !== "编辑") {
-      return false;
-    }
-
-    const style = window.getComputedStyle(element);
-    return style.display !== "none" && style.visibility !== "hidden";
-  }) || null;
-}
-
-function replaceEditorContent(editor, content) {
-  editor.focus();
-
-  const selection = window.getSelection();
-  if (!selection) {
-    throw new Error("无法获取编辑器选择区");
-  }
-
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  selection.removeAllRanges();
-  selection.addRange(range);
-
-  const deleted = document.execCommand("delete", false);
-  const inserted = document.execCommand("insertText", false, content);
-
-  if (!deleted && !inserted) {
-    editor.textContent = content;
-  }
-
-  editor.dispatchEvent(new InputEvent("input", {
-    bubbles: true,
-    data: content,
-    inputType: "insertText"
-  }));
+  await waitForElement([
+    "#lark-text-editor .ne-engine[contenteditable='true']",
+    "#lark-doc-edit-root .ne-engine[contenteditable='true']",
+    ".lark-editor.lark-editor-lake .ne-engine[contenteditable='true']"
+  ], 15000);
 }
 
 function waitForTaobaoItems(timeoutMs = 15000) {
@@ -812,13 +951,235 @@ function isYuqueEditMode() {
   return Boolean(
     document.body &&
     document.body.className.includes("editModeBody")
-  ) || Boolean(document.querySelector(".ne-engine[contenteditable='true']"));
+  ) || Boolean(
+    document.querySelector("#lark-text-editor .ne-engine[contenteditable='true']") ||
+    document.querySelector("#lark-doc-edit-root .ne-engine[contenteditable='true']") ||
+    document.querySelector(".lark-editor.lark-editor-lake .ne-engine[contenteditable='true']")
+  );
 }
 
 function wait(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+async function fetchYuqueContent(context) {
+  const embeddedContent = extractYuqueContentFromPage();
+  if (embeddedContent) {
+    return embeddedContent;
+  }
+
+  const response = await fetch(`/api/docs/${encodeURIComponent(context.docId)}`, {
+    method: "GET",
+    credentials: "include",
+    headers: buildYuqueHeaders(context, false)
+  });
+
+  if (!response.ok) {
+    throw new Error(`读取羽雀文档内容失败: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const payload = extractYuqueContentPayload(data);
+  if (!payload) {
+    throw new Error("未从羽雀接口响应中解析到文档内容");
+  }
+
+  return payload;
+}
+
+function extractYuqueContentFromPage() {
+  const html = document.documentElement.innerHTML;
+  if (!html) {
+    return null;
+  }
+
+  const bodyAsl =
+    extractEmbeddedJsonString(html, "body_draft_asl") ||
+    extractEmbeddedJsonString(html, "body_asl");
+  const bodyHtml =
+    extractEmbeddedJsonString(html, "body_draft") ||
+    extractEmbeddedJsonString(html, "body") ||
+    extractEmbeddedJsonString(html, "body_html");
+  const draftVersion = extractEmbeddedJsonNumber(html, "draft_version");
+
+  if (!bodyAsl || !bodyHtml) {
+    return null;
+  }
+
+  return {
+    format: extractEmbeddedJsonString(html, "format") || "lake",
+    body_asl: bodyAsl,
+    body_html: bodyHtml,
+    draft_version: draftVersion || 1,
+    sync_dynamic_data: false,
+    created_by: "online",
+    save_type: "auto",
+    edit_type: extractEmbeddedJsonString(html, "edit_type") || "Lake"
+  };
+}
+
+function extractEmbeddedJsonString(html, key) {
+  const pattern = new RegExp(`"${escapeRegExp(key)}":"((?:\\\\.|[^"\\\\])*)"`);
+  const match = html.match(pattern);
+  if (!match) {
+    return "";
+  }
+
+  try {
+    return JSON.parse(`"${match[1]}"`);
+  } catch (error) {
+    return "";
+  }
+}
+
+function extractEmbeddedJsonNumber(html, key) {
+  const pattern = new RegExp(`"${escapeRegExp(key)}":(\\d+)`);
+  const match = html.match(pattern);
+  return match ? Number(match[1]) : 0;
+}
+
+async function saveYuqueContent(context, content) {
+  const payload = {
+    format: content.format || "lake",
+    body_asl: content.body_asl || "",
+    draft_version: content.draft_version || 1,
+    sync_dynamic_data: Boolean(content.sync_dynamic_data),
+    created_by: content.created_by || "online",
+    body_html: content.body_html || "",
+    save_type: content.save_type || "auto",
+    edit_type: content.edit_type || "Lake"
+  };
+
+  const response = await fetch(`/api/docs/${encodeURIComponent(context.docId)}/content`, {
+    method: "POST",
+    credentials: "include",
+    headers: buildYuqueHeaders(context, true),
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const message = await safeReadResponseText(response);
+    throw new Error(`保存羽雀文档失败: ${response.status} ${message}`);
+  }
+}
+
+async function publishYuqueDoc(context) {
+  const response = await fetch(`/api/docs/${encodeURIComponent(context.docId)}/publish`, {
+    method: "POST",
+    credentials: "include",
+    headers: buildYuqueHeaders(context, true),
+    body: JSON.stringify({
+      force: false,
+      notify: false,
+      cover: null,
+      ignoreGlobalMessage: true
+    })
+  });
+
+  if (!response.ok) {
+    const message = await safeReadResponseText(response);
+    throw new Error(`发布羽雀文档失败: ${response.status} ${message}`);
+  }
+
+  return {
+    ok: true
+  };
+}
+
+function buildYuqueHeaders(context, withJson) {
+  const headers = {
+    "x-requested-with": "XMLHttpRequest"
+  };
+
+  if (withJson) {
+    headers["content-type"] = "application/json";
+  }
+
+  if (context.csrfToken) {
+    headers["x-csrf-token"] = context.csrfToken;
+  }
+
+  if (context.login) {
+    headers["x-login"] = context.login;
+  }
+
+  return headers;
+}
+
+function extractYuqueContentPayload(data) {
+  const candidates = [
+    data,
+    data && data.data,
+    data && data.doc,
+    data && data.data && data.data.doc
+  ].filter(Boolean);
+
+  const raw = candidates.find((item) =>
+    (item.body_draft_asl && item.body_draft) ||
+    (item.body_asl && item.body) ||
+    (item.body_asl && item.body_html)
+  );
+
+  if (!raw) {
+    return null;
+  }
+
+  return {
+    format: raw.format || "lake",
+    body_asl: raw.body_draft_asl || raw.body_asl || "",
+    body_html: raw.body_draft || raw.body || raw.body_html || "",
+    draft_version: raw.draft_version || 1,
+    sync_dynamic_data: Boolean(raw.sync_dynamic_data),
+    created_by: raw.created_by || "online",
+    save_type: raw.save_type || "auto",
+    edit_type: raw.edit_type || "Lake"
+  };
+}
+
+function applyTextReplacementsToMarkup(markup, replacements) {
+  let nextMarkup = String(markup || "");
+
+  replacements.forEach((item) => {
+    const id = String(item && item.id || "").trim();
+    const text = String(item && item.text || "").trim();
+    if (!id) {
+      return;
+    }
+
+    const pattern = new RegExp(
+      `(<span\\b[^>]*\\bid="${escapeRegExp(id)}"[^>]*>)([\\s\\S]*?)(</span>)`,
+      "g"
+    );
+
+    nextMarkup = nextMarkup.replace(pattern, (_, start, _content, end) => {
+      return `${start}${escapeMarkupText(text)}${end}`;
+    });
+  });
+
+  return nextMarkup;
+}
+
+function escapeMarkupText(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeRegExp(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function safeReadResponseText(response) {
+  try {
+    return truncate(await response.text(), 300);
+  } catch (error) {
+    return "";
+  }
 }
 
 function focusAndSetValue(input, value) {
