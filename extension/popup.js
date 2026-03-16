@@ -1,5 +1,6 @@
 const statusEl = document.getElementById("service-status");
-const featureListEl = document.getElementById("feature-list");
+const featureSelectEl = document.getElementById("feature-select");
+const featureDescriptionEl = document.getElementById("feature-description");
 const featureInputSectionEl = document.getElementById("feature-input-section");
 const featureInputEl = document.getElementById("feature-input");
 const buttonEl = document.getElementById("action-button");
@@ -175,23 +176,15 @@ function sendRuntimeMessage(message) {
 }
 
 function renderFeatureList() {
-  featureListEl.innerHTML = FEATURES.map((feature) => {
-    const selectedClass = feature.id === selectedFeatureId ? "feature-card selected" : "feature-card";
-    return `
-      <button class="${selectedClass}" type="button" data-feature-id="${escapeHtml(feature.id)}">
-        <span class="feature-card-title">${escapeHtml(feature.title)}</span>
-        <span class="feature-card-desc">${escapeHtml(feature.description)}</span>
-      </button>
-    `;
+  featureSelectEl.innerHTML = FEATURES.map((feature) => {
+    const selected = feature.id === selectedFeatureId ? ' selected="selected"' : "";
+    return `<option value="${escapeHtml(feature.id)}"${selected}>${escapeHtml(feature.title)}</option>`;
   }).join("");
 
-  featureListEl.querySelectorAll("[data-feature-id]").forEach((element) => {
-    element.addEventListener("click", () => {
-      selectedFeatureId = element.getAttribute("data-feature-id") || FEATURES[0].id;
-      renderFeatureList();
-      syncFeatureView();
-      clearResults();
-    });
+  featureSelectEl.addEventListener("change", () => {
+    selectedFeatureId = featureSelectEl.value || FEATURES[0].id;
+    syncFeatureView();
+    clearResults();
   });
 }
 
@@ -250,6 +243,8 @@ function getSelectedFeature() {
 
 function syncFeatureView() {
   const feature = getSelectedFeature();
+  featureSelectEl.value = feature.id;
+  featureDescriptionEl.textContent = feature.description || "";
   buttonEl.textContent = feature.actionLabel;
   summaryTitleEl.textContent = feature.summaryTitle;
   functionsTitleEl.textContent = feature.functionsTitle;

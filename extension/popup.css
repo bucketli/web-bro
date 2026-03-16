@@ -68,6 +68,24 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+.feature-select {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  color: #111827;
+  background: #ffffff;
+}
+
+.feature-description {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #4b5563;
+}
+
 .input-section {
   margin-bottom: 12px;
 }
@@ -92,40 +110,6 @@ button:disabled {
 
 .hidden {
   display: none;
-}
-
-.feature-list {
-  display: grid;
-  gap: 8px;
-}
-
-.feature-card {
-  text-align: left;
-  background: #ffffff;
-  color: #111827;
-  box-shadow: inset 0 0 0 1px #d1d5db;
-}
-
-.feature-card.selected {
-  background: #111827;
-  color: #ffffff;
-  box-shadow: none;
-}
-
-.feature-card-title,
-.feature-card-desc {
-  display: block;
-}
-
-.feature-card-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.feature-card-desc {
-  margin-top: 4px;
-  font-size: 12px;
-  opacity: 0.8;
 }
 
 .result-section {
