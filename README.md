@@ -36,8 +36,8 @@
     "dbTypeLabel": "MySQL",
     "host": "127.0.0.1",
     "port": "3306",
-    "account": "origin",
-    "password": "123456",
+    "account": "user",
+    "password": "passwd",
     "description": "自动测试添加"
   }
 }
