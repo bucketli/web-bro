@@ -45,6 +45,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "RUN_CC_AUTOMATION_CHECK") {
+    runCcAutomationCheck(message.expectedUrl)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "RUN_CC_DATASOURCE_ADD_CHECK") {
+    runCcDataSourceAddCheck(message.expectedListUrl, message.expectedAddUrl, message.mysqlAddConfig)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "RUN_CC_MYSQL_CONNECTION_TEST") {
+    runCcMySqlConnectionTest(message.expectedListUrl, message.mySqlDataSourceId_1)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
   return false;
 });
 
@@ -553,6 +574,1227 @@ async function collectTaobaoItems(page) {
       sampleTitles: items.slice(0, 3).map((item) => item.title)
     }
   };
+}
+
+async function runCcAutomationCheck(expectedUrl) {
+  await wait(1000);
+
+  const currentUrl = window.location.href;
+  const expected = String(expectedUrl || "").trim();
+  const isTargetPage = !expected || currentUrl.startsWith(expected);
+
+  if (!isTargetPage) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `当前页面不是目标地址：${currentUrl}`,
+        url: currentUrl
+      }
+    };
+  }
+
+  const errorSignals = collectCcErrorSignals();
+  const passed = errorSignals.length === 0;
+
+  return {
+    ok: true,
+    data: {
+      passed,
+      reason: passed
+        ? "页面刷新后未检测到明显异常"
+        : `检测到异常信号：${errorSignals.join("；")}`,
+      url: currentUrl,
+      signals: errorSignals
+    }
+  };
+}
+
+async function runCcDataSourceAddCheck(expectedListUrl, expectedAddUrl, mysqlAddConfig) {
+  await wait(600);
+  const addConfig = normalizeMySqlAddConfig(mysqlAddConfig);
+
+  const fromUrl = window.location.href;
+  if (!isUrlMatched(fromUrl, expectedListUrl)) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `当前页面不是数据源列表页：${fromUrl}`,
+        fromUrl,
+        toUrl: fromUrl,
+        fillFields: []
+      }
+    };
+  }
+
+  const addButton = findButtonByText("新增数据源");
+  if (!addButton) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: "未找到“新增数据源”按钮",
+        fromUrl,
+        toUrl: fromUrl,
+        fillFields: []
+      }
+    };
+  }
+
+  addButton.click();
+  await wait(200);
+
+  const toUrl = await waitForUrlChange(expectedAddUrl, fromUrl, 10000);
+  const reachedAddPage = isUrlMatched(toUrl, expectedAddUrl);
+  if (!reachedAddPage) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `点击后未进入目标页，当前地址：${toUrl}`,
+        fromUrl,
+        toUrl,
+        fillFields: [],
+        mysqlRequiredFields: { required: [], found: [], missing: [] },
+        stepResults: [],
+        submitTriggered: false
+      }
+    };
+  }
+
+  await wait(500);
+
+  const stepResults = [];
+  const deploymentSelected = selectRadioOptionByGroupLabel("部署类型", addConfig.deployTypeLabel);
+  stepResults.push({
+    id: "select-deploy-type",
+    name: `选择部署类型=${addConfig.deployTypeLabel}`,
+    passed: deploymentSelected
+  });
+
+  const dbTypeSelected = selectRadioOptionByGroupLabel("数据库类型", addConfig.dbTypeLabel);
+  stepResults.push({
+    id: "select-db-type",
+    name: `选择数据库类型=${addConfig.dbTypeLabel}`,
+    passed: dbTypeSelected
+  });
+
+  const networkFilled = fillNetworkAddress(addConfig.host, addConfig.port);
+  stepResults.push({
+    id: "fill-network",
+    name: `填写网络地址=${addConfig.host}`,
+    passed: networkFilled
+  });
+
+  const accountFilled = fillInputByFormLabel("账号", addConfig.account);
+  stepResults.push({
+    id: "fill-account",
+    name: `填写账号=${addConfig.account}`,
+    passed: accountFilled
+  });
+
+  const passwordFilled = fillInputByFormLabel("密码", addConfig.password);
+  stepResults.push({
+    id: "fill-password",
+    name: "填写密码=****",
+    passed: passwordFilled
+  });
+
+  const descFilled = fillInputByFormLabel("描述", addConfig.description);
+  stepResults.push({
+    id: "fill-description",
+    name: `填写描述=${addConfig.description}`,
+    passed: descFilled
+  });
+
+  const mysqlRequiredFields = collectMySqlRequiredFields();
+  stepResults.push({
+    id: "detect-required-fields",
+    name: "识别 MySQL 关键项(网络地址/账号/密码/描述)",
+    passed: mysqlRequiredFields.missing.length === 0
+  });
+
+  const addApiResponsePromise = waitForDataSourceAddApiResponse(20000);
+  const submitTriggered = clickButtonByText("新增数据源", ".add-dataSource-tools");
+  stepResults.push({
+    id: "submit-create",
+    name: "触发新增数据源提交",
+    passed: submitTriggered
+  });
+
+  const beforeSubmitUrl = window.location.href;
+  const addApiResponse = submitTriggered
+    ? await addApiResponsePromise
+    : { id: "", matched: false };
+  const afterSubmitUrl = window.location.href;
+  const mySqlDataSourceId_1 = addApiResponse.id;
+  const addApiDebug = buildAddApiDebug(addApiResponse);
+  console.log("[cc-automation] datasource add api capture", addApiDebug);
+  const fillFields = collectFormFillFields();
+  const failedSteps = stepResults.filter((item) => !item.passed).map((item) => item.name);
+  const passed = failedSteps.length === 0 && submitTriggered && Boolean(mySqlDataSourceId_1);
+  const fieldPreview = fillFields
+    .slice(0, 4)
+    .map((item) => item.label || item.placeholder || item.name || "未命名字段")
+    .join("、");
+
+  return {
+    ok: true,
+    data: {
+      passed,
+      reason: passed
+        ? `已触发 MySQL 数据源新增，识别到 ${fillFields.length} 个填充项${fieldPreview ? `（示例：${fieldPreview}）` : ""}${mySqlDataSourceId_1 ? `；mySqlDataSourceId_1=${mySqlDataSourceId_1}` : ""}`
+        : `步骤未完成：${failedSteps.join("、") || "未知错误"}${mysqlRequiredFields.missing.length ? `；缺少关键项：${mysqlRequiredFields.missing.join("、")}` : ""}${!mySqlDataSourceId_1 ? "；未从 /rdp/console/api/v1/datasource/add 响应中提取到 dataSourceId" : ""}；addApiMatched=${addApiResponse.matched ? "true" : "false"}；addApiSeen=${addApiDebug.seenCount}；提交前URL：${beforeSubmitUrl}；提交后URL：${afterSubmitUrl}`,
+      fromUrl,
+      toUrl,
+      fillFields,
+      mysqlRequiredFields,
+      stepResults,
+      submitTriggered,
+      beforeSubmitUrl,
+      afterSubmitUrl,
+      mySqlDataSourceId_1,
+      addApiMatched: addApiResponse.matched,
+      addApiDebug
+    }
+  };
+}
+
+function normalizeMySqlAddConfig(config) {
+  const value = config && typeof config === "object" ? config : {};
+  return {
+    deployTypeLabel: normalizeWhitespace(value.deployTypeLabel || "自建"),
+    dbTypeLabel: normalizeWhitespace(value.dbTypeLabel || "MySQL"),
+    host: normalizeWhitespace(value.host || "127.0.0.1"),
+    port: normalizeWhitespace(value.port || "3306"),
+    account: normalizeWhitespace(value.account || "origin"),
+    password: String(value.password || "123456"),
+    description: normalizeWhitespace(value.description || "自动测试添加")
+  };
+}
+
+async function runCcMySqlConnectionTest(expectedListUrl, mySqlDataSourceId_1) {
+  await wait(400);
+  const currentUrl = window.location.href;
+  if (!isUrlMatched(currentUrl, expectedListUrl)) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `当前页面不是数据源列表页：${currentUrl}`,
+        mySqlDataSourceId_1: String(mySqlDataSourceId_1 || "")
+      }
+    };
+  }
+
+  const normalizedId = String(mySqlDataSourceId_1 || "").trim();
+  if (!normalizedId) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: "缺少 mySqlDataSourceId_1，无法定位数据源行",
+        mySqlDataSourceId_1: ""
+      }
+    };
+  }
+
+  let row = await waitForDataSourceRowById(normalizedId, 4000);
+  if (!row) {
+    const filterApplied = await applyDataSourceIdFilter(normalizedId);
+    if (filterApplied) {
+      row = await waitForDataSourceRowById(normalizedId, 6000);
+      if (!row) {
+        row = await waitForFirstDataSourceRow(3000);
+      }
+    }
+  }
+  if (!row) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `未找到数据源行（mySqlDataSourceId_1=${normalizedId}）`,
+        mySqlDataSourceId_1: normalizedId
+      }
+    };
+  }
+
+  const entryButton = findTestConnectionEntry(row);
+  if (!entryButton) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: "未找到列表中的“测试连接”入口",
+        mySqlDataSourceId_1: normalizedId
+      }
+    };
+  }
+
+  entryButton.click();
+  const modal = await waitForVisibleModal(10000);
+  if (!modal) {
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: "点击入口后未出现测试连接弹窗",
+        mySqlDataSourceId_1: normalizedId
+      }
+    };
+  }
+
+  const modalTestButton = await waitForModalTestButton(modal, 6000);
+  if (!modalTestButton) {
+    const modalButtons = collectModalButtonsText(modal);
+    return {
+      ok: true,
+      data: {
+        passed: false,
+        reason: `弹窗中未找到“测试连接”按钮（检测到按钮：${modalButtons.join("、") || "无"}）`,
+        mySqlDataSourceId_1: normalizedId
+      }
+    };
+  }
+
+  modalTestButton.click();
+  await wait(1800);
+
+  const errorSignals = collectConnectionErrorSignals();
+  const passed = errorSignals.length === 0;
+
+  return {
+    ok: true,
+    data: {
+      passed,
+      reason: passed
+        ? "测试连接已触发，未检测到错误信息"
+        : `测试连接失败：${errorSignals.join("；")}`,
+      mySqlDataSourceId_1: normalizedId,
+      errors: errorSignals
+    }
+  };
+}
+
+function collectCcErrorSignals() {
+  const signals = [];
+  const errorSelectors = [
+    ".ant-result-error",
+    ".error-page",
+    ".exception",
+    ".exception-container",
+    "#webpack-dev-server-client-overlay",
+    ".runtime-error"
+  ];
+
+  for (const selector of errorSelectors) {
+    if (document.querySelector(selector)) {
+      signals.push(`命中错误元素 ${selector}`);
+    }
+  }
+
+  const pageText = normalizeWhitespace(document.body ? document.body.innerText : "");
+  const patterns = [
+    /uncaught\s+(typeerror|referenceerror|syntaxerror)/i,
+    /cannot\s+read\s+properties/i,
+    /cannot\s+set\s+properties/i,
+    /failed\s+to\s+fetch/i,
+    /network\s+error/i,
+    /系统异常|页面异常|请求失败|服务异常|发生错误|程序错误/i
+  ];
+
+  patterns.forEach((pattern) => {
+    if (pattern.test(pageText)) {
+      signals.push(`命中异常文案 ${pattern.source}`);
+    }
+  });
+
+  return Array.from(new Set(signals));
+}
+
+function findButtonByText(label, root = document) {
+  const target = normalizeWhitespace(label);
+  if (!target) {
+    return null;
+  }
+
+  const selectors = [
+    "button",
+    '[role="button"]',
+    ".ivu-btn",
+    ".el-button",
+    ".ant-btn"
+  ];
+
+  for (const selector of selectors) {
+    const nodes = Array.from(root.querySelectorAll(selector));
+    for (const node of nodes) {
+      const text = normalizeWhitespace(node.textContent || "");
+      if (text.includes(target)) {
+        return node;
+      }
+    }
+  }
+
+  return null;
+}
+
+function findDataSourceRowById(dataSourceId) {
+  const rows = Array.from(document.querySelectorAll(".ivu-table-body .ivu-table-tbody tr.ivu-table-row"));
+  return rows.find((row) => rowMatchesDataSourceId(row, dataSourceId)) || null;
+}
+
+async function waitForDataSourceRowById(dataSourceId, timeoutMs = 10000) {
+  const startedAt = Date.now();
+  let refreshed = false;
+  while (Date.now() - startedAt <= timeoutMs) {
+    const row = findDataSourceRowById(dataSourceId);
+    if (row) {
+      return row;
+    }
+
+    if (!refreshed && Date.now() - startedAt > 2500) {
+      clickRefreshButton();
+      refreshed = true;
+    }
+    await wait(250);
+  }
+  return null;
+}
+
+async function waitForFirstDataSourceRow(timeoutMs = 3000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const rows = Array.from(document.querySelectorAll(".ivu-table-body .ivu-table-tbody tr.ivu-table-row"));
+    if (rows.length > 0) {
+      return rows[0];
+    }
+    await wait(200);
+  }
+  return null;
+}
+
+function rowMatchesDataSourceId(row, dataSourceId) {
+  if (!(row instanceof HTMLElement)) {
+    return false;
+  }
+
+  const id = String(dataSourceId || "").trim();
+  if (!id) {
+    return false;
+  }
+
+  const text = normalizeWhitespace(row.textContent || "");
+  const html = String(row.innerHTML || "");
+  const escapedId = escapeRegExp(id);
+  const patterns = [
+    new RegExp(`\\bid\\s*[:=]\\s*${escapedId}\\b`, "i"),
+    new RegExp(`\\bdata[-_]?source[-_]?id\\s*[:=]\\s*${escapedId}\\b`, "i"),
+    new RegExp(`\\bdatasourceid\\s*[:=]\\s*${escapedId}\\b`, "i"),
+    new RegExp(`\\bdataSourceId\\s*[:=]\\s*${escapedId}\\b`, "i"),
+    new RegExp(`["']id["']\\s*:\\s*${escapedId}\\b`, "i"),
+    new RegExp(`["']dataSourceId["']\\s*:\\s*${escapedId}\\b`, "i"),
+    new RegExp(`\\bid=${escapedId}(?:\\D|$)`, "i"),
+    new RegExp(`\\bdata-row-key\\s*=\\s*["']?${escapedId}["']?`, "i"),
+    new RegExp(`\\brow-?id\\s*[:=]\\s*${escapedId}\\b`, "i")
+  ];
+
+  for (const pattern of patterns) {
+    if (pattern.test(text) || pattern.test(html)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function applyDataSourceIdFilter(dataSourceId) {
+  const form = document.querySelector(".page-header-container form");
+  if (!(form instanceof HTMLElement)) {
+    return false;
+  }
+
+  const formItems = Array.from(form.querySelectorAll(".ivu-form-item"));
+  if (formItems.length < 2) {
+    return false;
+  }
+
+  const keyItem = formItems[0];
+  const valueItem = formItems[1];
+  const keySelect = keyItem.querySelector(".ivu-select");
+  if (!(keySelect instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (!selectIViewOptionByText(keySelect, "数据源数字ID")) {
+    return false;
+  }
+
+  const valueInput = valueItem.querySelector("input.ivu-select-input, input.ivu-input, input[type='text']");
+  if (!(valueInput instanceof HTMLInputElement)) {
+    return false;
+  }
+  if (!setInputValue(valueInput, String(dataSourceId))) {
+    return false;
+  }
+  valueInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  valueInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
+
+  const queryButton = Array.from(form.querySelectorAll("button, .ivu-btn"))
+    .find((btn) => normalizeWhitespace(btn.textContent || "") === "查询");
+  if (queryButton) {
+    queryButton.click();
+  }
+
+  await wait(1200);
+  return true;
+}
+
+function selectIViewOptionByText(selectRoot, optionText) {
+  const selection = selectRoot.querySelector(".ivu-select-selection");
+  if (!(selection instanceof HTMLElement)) {
+    return false;
+  }
+
+  selection.click();
+  const target = normalizeWhitespace(optionText);
+  const options = Array.from(document.querySelectorAll(".ivu-select-dropdown .ivu-select-item"));
+  const option = options.find((item) => normalizeWhitespace(item.textContent || "") === target);
+  if (!option) {
+    return false;
+  }
+
+  option.click();
+  return true;
+}
+
+function clickRefreshButton() {
+  const container = document.querySelector(".page-header-function");
+  if (!container) {
+    return false;
+  }
+
+  const buttons = Array.from(container.querySelectorAll("button, .ivu-btn"));
+  const refreshButton = buttons.find((button) => {
+    const text = normalizeWhitespace(button.textContent || "");
+    return text === "" && button.querySelector("use[xlink\\:href*='Refresh'], use[href*='Refresh']");
+  });
+
+  if (!refreshButton) {
+    return false;
+  }
+
+  refreshButton.click();
+  return true;
+}
+
+function findTestConnectionEntry(row) {
+  if (!(row instanceof HTMLElement)) {
+    return null;
+  }
+
+  const links = Array.from(row.querySelectorAll("a, button, [role='button']"));
+  const direct = links.find((node) => normalizeWhitespace(node.textContent || "") === "测试连接");
+  if (direct) {
+    return direct;
+  }
+
+  const fixedRows = Array.from(document.querySelectorAll(".ivu-table-fixed-right .ivu-table-fixed-body tr.ivu-table-row"));
+  for (const fixedRow of fixedRows) {
+    if (!normalizeWhitespace(fixedRow.textContent || "").includes("测试连接")) {
+      continue;
+    }
+    const candidate = Array.from(fixedRow.querySelectorAll("a, button, [role='button']"))
+      .find((node) => normalizeWhitespace(node.textContent || "") === "测试连接");
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function waitForModalTestButton(modal, timeoutMs = 6000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const button = findModalTestButton(modal);
+    if (button) {
+      return button;
+    }
+    await wait(200);
+  }
+  return null;
+}
+
+function findModalTestButton(modal) {
+  if (!(modal instanceof HTMLElement)) {
+    return null;
+  }
+
+  const bodyButton = Array.from(
+    modal.querySelectorAll(".ant-modal-body button, .ivu-modal-body button, .el-dialog__body button")
+  ).find((btn) => normalizeWhitespace(btn.textContent || "").includes("测试连接"));
+  if (bodyButton) {
+    return bodyButton;
+  }
+
+  const exact = findButtonByText("测试连接", modal);
+  if (exact) {
+    return exact;
+  }
+
+  const buttons = Array.from(modal.querySelectorAll("button, .ivu-btn, .ant-btn, .el-button, [role='button']"));
+  const primaryKeyword = ["测试", "连接"];
+  const primary = buttons.find((btn) => {
+    const text = normalizeWhitespace(btn.textContent || "");
+    return text && primaryKeyword.every((kw) => text.includes(kw));
+  });
+  if (primary) {
+    return primary;
+  }
+
+  const footerPrimary = modal.querySelector(
+    ".ivu-modal-footer .ivu-btn-primary, .ant-modal-footer .ant-btn-primary, .el-dialog__footer .el-button--primary"
+  );
+  if (footerPrimary instanceof HTMLElement) {
+    return footerPrimary;
+  }
+
+  return null;
+}
+
+function collectModalButtonsText(modal) {
+  if (!(modal instanceof HTMLElement)) {
+    return [];
+  }
+
+  const buttons = Array.from(modal.querySelectorAll("button, .ivu-btn, .ant-btn, .el-button, [role='button']"));
+  return buttons
+    .map((btn) => normalizeWhitespace(btn.textContent || ""))
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+async function waitForVisibleModal(timeoutMs = 10000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const modal = findVisibleModal();
+    if (modal) {
+      return modal;
+    }
+    await wait(200);
+  }
+  return null;
+}
+
+function findVisibleModal() {
+  const selectors = [".ant-modal-wrap .ant-modal-content", ".ivu-modal-wrap .ivu-modal-content", ".el-dialog"];
+  for (const selector of selectors) {
+    const nodes = Array.from(document.querySelectorAll(selector));
+    const visible = nodes.find((node) => isElementVisible(node));
+    if (visible) {
+      return visible;
+    }
+  }
+  return null;
+}
+
+function collectConnectionErrorSignals() {
+  const signals = [];
+  const text = normalizeWhitespace(document.body ? document.body.innerText : "");
+  const patterns = [
+    /测试连接失败/i,
+    /连接失败/i,
+    /无法连接/i,
+    /认证失败/i,
+    /超时/i,
+    /error/i,
+    /exception/i,
+    /拒绝连接/i
+  ];
+
+  patterns.forEach((pattern) => {
+    if (pattern.test(text)) {
+      signals.push(`命中错误文案 ${pattern.source}`);
+    }
+  });
+
+  const explicitErrorNodes = Array.from(document.querySelectorAll(
+    ".ivu-message-error, .ivu-notice-error, .ant-message-error, .el-message--error, .ivu-alert-error"
+  ));
+  explicitErrorNodes.forEach((node) => {
+    const msg = normalizeWhitespace(node.textContent || "");
+    if (msg) {
+      signals.push(msg);
+    }
+  });
+
+  return Array.from(new Set(signals));
+}
+
+function isUrlMatched(currentUrl, expectedUrl) {
+  const current = String(currentUrl || "").trim();
+  const expected = String(expectedUrl || "").trim();
+  if (!expected) {
+    return true;
+  }
+  if (!current) {
+    return false;
+  }
+  if (current === expected || current.startsWith(expected)) {
+    return true;
+  }
+
+  return getHashPath(current) === getHashPath(expected);
+}
+
+function getHashPath(url) {
+  const value = String(url || "");
+  const hashIndex = value.indexOf("#");
+  if (hashIndex === -1) {
+    return "";
+  }
+
+  return value.slice(hashIndex + 1).replace(/[?#].*$/, "");
+}
+
+function waitForUrlChange(expectedUrl, beforeUrl, timeoutMs = 10000) {
+  if (isUrlMatched(window.location.href, expectedUrl) || window.location.href !== beforeUrl) {
+    return Promise.resolve(window.location.href);
+  }
+
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      const current = window.location.href;
+      const timeout = Date.now() - startedAt > timeoutMs;
+      if (isUrlMatched(current, expectedUrl) || current !== beforeUrl || timeout) {
+        window.clearInterval(timer);
+        resolve(current);
+      }
+    }, 120);
+  });
+}
+
+function collectFormFillFields() {
+  const seen = new Set();
+  const fields = [];
+  const items = Array.from(document.querySelectorAll(".ivu-form-item, .el-form-item, .ant-form-item, form .form-item"));
+
+  items.forEach((item) => {
+    const control = item.querySelector("input, textarea, select, .ivu-select, .el-select, .ant-select");
+    if (!control || !isElementVisible(control)) {
+      return;
+    }
+
+    const labelNode = item.querySelector(".ivu-form-item-label, .el-form-item__label, .ant-form-item-label, label");
+    const label = normalizeWhitespace(labelNode ? labelNode.textContent : "");
+    const key = `${label}|${getControlType(control)}|${getFieldPlaceholder(control)}`;
+    if (!key || seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    fields.push({
+      label,
+      name: readFieldName(control),
+      type: getControlType(control),
+      placeholder: getFieldPlaceholder(control),
+      required: isFieldRequired(item, control)
+    });
+  });
+
+  if (fields.length) {
+    return fields;
+  }
+
+  const fallbackControls = Array.from(document.querySelectorAll("input, textarea, select, .ivu-select"));
+  fallbackControls.forEach((control) => {
+    if (!isElementVisible(control)) {
+      return;
+    }
+
+    const name = readFieldName(control);
+    const placeholder = getFieldPlaceholder(control);
+    const type = getControlType(control);
+    const key = `${name}|${type}|${placeholder}`;
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    fields.push({
+      label: "",
+      name,
+      type,
+      placeholder,
+      required: isFieldRequired(control.closest("form, .ivu-form-item") || control, control)
+    });
+  });
+
+  return fields;
+}
+
+function collectMySqlRequiredFields() {
+  const requiredLabels = ["网络地址", "账号", "密码", "描述"];
+  const found = [];
+  const missing = [];
+
+  requiredLabels.forEach((label) => {
+    const labelNode = findLabelNode(label);
+    if (labelNode) {
+      found.push(label);
+    } else {
+      missing.push(label);
+    }
+  });
+
+  return {
+    required: requiredLabels,
+    found,
+    missing
+  };
+}
+
+function findLabelNode(labelText) {
+  const target = normalizeWhitespace(labelText);
+  const labels = Array.from(document.querySelectorAll(".ivu-form-item-label, .el-form-item__label, .ant-form-item-label, label"));
+  return labels.find((node) => normalizeWhitespace(node.textContent || "").includes(target)) || null;
+}
+
+function findFormItemByLabel(labelText) {
+  const labelNode = findLabelNode(labelText);
+  if (!labelNode) {
+    return null;
+  }
+  return labelNode.closest(".ivu-form-item, .el-form-item, .ant-form-item");
+}
+
+function selectRadioOptionByGroupLabel(groupLabel, optionText) {
+  const item = findFormItemByLabel(groupLabel);
+  if (!item) {
+    return false;
+  }
+
+  const options = Array.from(item.querySelectorAll(".ivu-radio-wrapper, label"));
+  const target = options.find((node) => normalizeWhitespace(node.textContent || "").includes(normalizeWhitespace(optionText)));
+  if (!target) {
+    return false;
+  }
+
+  target.click();
+  const input = target.querySelector("input[type='radio']");
+  if (input) {
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  return target.classList.contains("ivu-radio-wrapper-checked") || Boolean(input && input.checked);
+}
+
+function fillNetworkAddress(host, port) {
+  const item = findFormItemByLabel("网络地址");
+  if (!item) {
+    return false;
+  }
+
+  const inputs = Array.from(item.querySelectorAll("input.ivu-input, input[type='text']"))
+    .filter((input) => isElementVisible(input));
+  if (!inputs.length) {
+    return false;
+  }
+
+  let hostInput = inputs.find((input) => {
+    const placeholder = normalizeWhitespace(input.getAttribute("placeholder") || "");
+    return placeholder.includes("ip") || placeholder.includes("domain");
+  });
+  if (!hostInput) {
+    hostInput = inputs[0];
+  }
+
+  let portInput = inputs.find((input) => {
+    const placeholder = normalizeWhitespace(input.getAttribute("placeholder") || "");
+    return placeholder.includes("port");
+  });
+
+  const hostOk = setInputValue(hostInput, host);
+  const portOk = portInput ? setInputValue(portInput, port) : true;
+  return hostOk && portOk;
+}
+
+function fillInputByFormLabel(labelText, value) {
+  const item = findFormItemByLabel(labelText);
+  if (!item) {
+    return false;
+  }
+
+  const label = normalizeWhitespace(labelText);
+  let targetInput = null;
+  if (label === "密码") {
+    targetInput = item.querySelector("input[type='password']");
+  } else {
+    targetInput = item.querySelector("input.ivu-input, input[type='text'], textarea");
+  }
+
+  if (!targetInput || !isElementVisible(targetInput)) {
+    return false;
+  }
+
+  return setInputValue(targetInput, value);
+}
+
+function setInputValue(input, value) {
+  if (!(input instanceof HTMLInputElement) && !(input instanceof HTMLTextAreaElement)) {
+    return false;
+  }
+
+  input.focus();
+  const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value");
+  if (setter && typeof setter.set === "function") {
+    setter.set.call(input, value);
+  } else {
+    input.value = value;
+  }
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  input.blur();
+  return normalizeWhitespace(input.value) === normalizeWhitespace(value);
+}
+
+function clickButtonByText(buttonText, containerSelector) {
+  const container = containerSelector ? document.querySelector(containerSelector) : document;
+  if (!container) {
+    return false;
+  }
+
+  const buttons = Array.from(container.querySelectorAll("button, .ivu-btn, [role='button']"));
+  const target = buttons.find((node) => normalizeWhitespace(node.textContent || "") === normalizeWhitespace(buttonText));
+  if (!target) {
+    return false;
+  }
+
+  target.click();
+  return true;
+}
+
+function detectDataSourceId(beforeSubmitUrl, afterSubmitUrl) {
+  const candidates = [
+    extractNumericIdFromUrl(afterSubmitUrl),
+    extractNumericIdFromUrl(beforeSubmitUrl),
+    extractNumericIdFromPageText()
+  ].filter(Boolean);
+
+  return candidates.length ? String(candidates[0]) : "";
+}
+
+async function waitForDataSourceAddApiResponse(timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    let seenCount = 0;
+    let lastPacket = null;
+    const timer = window.setTimeout(() => {
+      window.removeEventListener("message", handleMessage);
+      resolve({
+        id: "",
+        matched: false,
+        seenCount,
+        lastPacket
+      });
+    }, timeoutMs);
+
+    function handleMessage(event) {
+      const packet = event && event.data ? event.data : null;
+      if (!packet || packet.source !== "CC_AUTOMATION_HOOK" || packet.type !== "CC_DATASOURCE_ADD_API_RESULT") {
+        return;
+      }
+      const requestUrl = packet && packet.meta && packet.meta.requestUrl ? String(packet.meta.requestUrl) : "";
+      if (!isDatasourceAddApiUrl(requestUrl)) {
+        return;
+      }
+
+      seenCount += 1;
+      lastPacket = packet;
+      const id = extractIdFromAddApiPayload(packet.payload);
+      if (!id) {
+        return;
+      }
+
+      window.clearTimeout(timer);
+      window.removeEventListener("message", handleMessage);
+      resolve({
+        id,
+        matched: true,
+        seenCount,
+        lastPacket
+      });
+    }
+
+    window.addEventListener("message", handleMessage);
+  });
+}
+
+function isDatasourceAddApiUrl(url) {
+  return String(url || "").includes("/rdp/console/api/v1/datasource/add");
+}
+
+function buildAddApiDebug(addApiResponse) {
+  const packet = addApiResponse && addApiResponse.lastPacket ? addApiResponse.lastPacket : null;
+  const payload = packet && packet.payload ? packet.payload : null;
+  const meta = packet && packet.meta ? packet.meta : {};
+  let payloadPreview = "";
+  try {
+    payloadPreview = JSON.stringify(payload || {});
+  } catch (error) {
+    payloadPreview = String(payload || "");
+  }
+
+  return {
+    matched: Boolean(addApiResponse && addApiResponse.matched),
+    seenCount: addApiResponse && typeof addApiResponse.seenCount === "number" ? addApiResponse.seenCount : 0,
+    transport: meta && meta.transport ? String(meta.transport) : "",
+    requestUrl: meta && meta.requestUrl ? String(meta.requestUrl) : "",
+    payloadPreview: payloadPreview.slice(0, 500)
+  };
+}
+
+function extractIdFromAddApiPayload(payload) {
+  if (!payload) {
+    return "";
+  }
+
+  if (typeof payload === "string") {
+    const directMatch = payload.match(/"data"\s*:\s*([0-9]{1,})/i);
+    return directMatch && directMatch[1] ? directMatch[1] : "";
+  }
+
+  if (typeof payload !== "object") {
+    return "";
+  }
+
+  if (typeof payload.__rawText === "string") {
+    const rawMatch = payload.__rawText.match(/"data"\s*:\s*([0-9]{1,})/i);
+    if (rawMatch && rawMatch[1]) {
+      return rawMatch[1];
+    }
+  }
+
+  const success = payload.success === true
+    || payload.code === "1"
+    || payload.code === 1
+    || payload.msg === "request success";
+  if (!success) {
+    return "";
+  }
+
+  const raw = payload.data;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return String(raw);
+  }
+
+  if (typeof raw === "string" && /^\d+$/.test(raw.trim())) {
+    return raw.trim();
+  }
+
+  if (typeof payload.id === "number" && Number.isFinite(payload.id)) {
+    return String(payload.id);
+  }
+
+  if (typeof payload.id === "string" && /^\d+$/.test(payload.id.trim())) {
+    return payload.id.trim();
+  }
+
+  if (raw && typeof raw === "object") {
+    if (typeof raw.id === "number" && Number.isFinite(raw.id)) {
+      return String(raw.id);
+    }
+    if (typeof raw.id === "string" && /^\d+$/.test(raw.id.trim())) {
+      return raw.id.trim();
+    }
+  }
+
+  return "";
+}
+
+function installDataSourceAddApiHook() {
+  if (document.getElementById("cc-datasource-add-hook")) {
+    return;
+  }
+
+  const script = document.createElement("script");
+  script.id = "cc-datasource-add-hook";
+  script.src = chrome.runtime.getURL("page-hook.js");
+  script.async = false;
+
+  (document.documentElement || document.head || document.body).appendChild(script);
+}
+
+function extractNumericIdFromUrl(url) {
+  const value = String(url || "");
+  if (!value) {
+    return "";
+  }
+
+  const patterns = [
+    /(?:dataSourceId|datasourceId|sourceId|id)=([0-9]{3,})/i,
+    /\/(?:ccdatasource|datasource)\/(?:detail|edit|view|success|result)?\/?([0-9]{3,})(?:[/?#]|$)/i,
+    /\/(?:success|result|detail)\/([0-9]{3,})(?:[/?#]|$)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+
+  return "";
+}
+
+function extractNumericIdFromPageText() {
+  const textParts = [];
+  const messageSelectors = [
+    ".ivu-message-notice-content-text",
+    ".ivu-notice-desc",
+    ".ivu-modal-body",
+    ".ant-message-notice-content",
+    ".el-message__content"
+  ];
+
+  messageSelectors.forEach((selector) => {
+    const nodes = document.querySelectorAll(selector);
+    nodes.forEach((node) => {
+      const text = normalizeWhitespace(node.textContent || "");
+      if (text) {
+        textParts.push(text);
+      }
+    });
+  });
+
+  const bodyText = normalizeWhitespace(document.body ? document.body.innerText : "");
+  if (bodyText) {
+    textParts.push(bodyText);
+  }
+
+  const text = textParts.join("\n");
+  if (!text) {
+    return "";
+  }
+
+  const patterns = [
+    /数据源(?:数字)?ID[:：\s#]*([0-9]{3,})/i,
+    /(?:data\s*source\s*id|datasourceid)[:：\s#]*([0-9]{3,})/i,
+    /"msg"\s*:\s*"request success"[\s\S]{0,220}"data"\s*:\s*([0-9]{1,})/i,
+    /"data"\s*:\s*([0-9]{1,})[\s\S]{0,220}"msg"\s*:\s*"request success"/i,
+    /\bdata\s*[:：]\s*([0-9]{1,})\b[\s\S]{0,120}\brequest success\b/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+
+  const scripts = Array.from(document.querySelectorAll("script"));
+  for (const script of scripts) {
+    const content = String(script.textContent || "");
+    if (!content) {
+      continue;
+    }
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+  }
+
+  return "";
+}
+
+function readFieldName(control) {
+  if (!(control instanceof HTMLElement)) {
+    return "";
+  }
+  return normalizeWhitespace(
+    control.getAttribute("name") ||
+    control.getAttribute("id") ||
+    control.getAttribute("data-name") ||
+    ""
+  );
+}
+
+function getControlType(control) {
+  if (!(control instanceof HTMLElement)) {
+    return "unknown";
+  }
+
+  if (control.matches(".ivu-select, .el-select, .ant-select")) {
+    return "select";
+  }
+
+  const tagName = control.tagName.toLowerCase();
+  if (tagName === "input") {
+    return control.getAttribute("type") || "text";
+  }
+  if (tagName === "textarea" || tagName === "select") {
+    return tagName;
+  }
+  return tagName;
+}
+
+function getFieldPlaceholder(control) {
+  if (!(control instanceof HTMLElement)) {
+    return "";
+  }
+
+  const ownPlaceholder = control.getAttribute("placeholder");
+  if (ownPlaceholder) {
+    return normalizeWhitespace(ownPlaceholder);
+  }
+
+  const innerInput = control.querySelector("input, textarea");
+  return normalizeWhitespace(innerInput ? innerInput.getAttribute("placeholder") : "");
+}
+
+function isFieldRequired(container, control) {
+  const controlRequired = control instanceof HTMLElement && (
+    control.hasAttribute("required") ||
+    control.getAttribute("aria-required") === "true"
+  );
+  if (controlRequired) {
+    return true;
+  }
+
+  if (!(container instanceof HTMLElement)) {
+    return false;
+  }
+
+  const className = container.className || "";
+  if (/required|is-required|ivu-form-item-required/.test(className)) {
+    return true;
+  }
+
+  const text = normalizeWhitespace(container.textContent || "");
+  return text.includes("*");
+}
+
+function isElementVisible(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (element.hidden) {
+    return false;
+  }
+
+  const style = window.getComputedStyle(element);
+  if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
 }
 
 function findFirst(selectors) {

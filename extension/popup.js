@@ -6,11 +6,17 @@ const featureInputEl = document.getElementById("feature-input");
 const buttonEl = document.getElementById("action-button");
 const bestItemSectionEl = document.getElementById("best-item-section");
 const bestItemCardEl = document.getElementById("best-item-card");
+const ccCasesSectionEl = document.getElementById("cc-cases-section");
+const ccCasesListEl = document.getElementById("cc-cases-list");
+const ccClearButtonEl = document.getElementById("cc-clear-button");
 const summaryTitleEl = document.getElementById("summary-title");
 const functionsTitleEl = document.getElementById("functions-title");
 const summaryListEl = document.getElementById("summary-list");
 const functionsListEl = document.getElementById("functions-list");
 const messageEl = document.getElementById("message");
+const summarySectionEl = summaryTitleEl.closest(".result-section");
+const functionsSectionEl = functionsTitleEl.closest(".result-section");
+const DEFAULT_CC_SITE_URL = "http://localhost:8080/";
 
 const FEATURES = [
   {
@@ -76,23 +82,89 @@ const FEATURES = [
         detail: "优化结果会自动写回编辑器，并点击更新按钮发布"
       }
     ]
+  },
+  {
+    id: "cc-automation-test",
+    title: "CC自动化测试",
+    description: "展示测试用例列表与执行状态（未开始、通过、未通过）",
+    actionLabel: "执行测试用例",
+    loadingLabel: "正在执行 CC 自动化测试...",
+    successLabel: "CC 自动化测试执行完成",
+    messageType: "RUN_CC_AUTOMATION_TEST",
+    summaryTitle: "测试摘要",
+    functionsTitle: "测试说明",
+    requiresInput: true,
+    inputLabel: "测试站点",
+    inputPlaceholder: "例如：http://localhost:8080",
+    defaultInputValue: DEFAULT_CC_SITE_URL,
+    emptyInputMessage: "请输入测试站点地址",
+    emptySummary: ["默认测试目标：localhost:8080", "测试页面：/#/data/job/list、/#/ccdatasource", "执行后将更新用例状态"]
   }
 ];
 
-let selectedFeatureId = FEATURES[0].id;
+let selectedFeatureId = "cc-automation-test";
 let taskPollTimer = null;
+let ccTaskPollTimer = null;
+const DEFAULT_CC_TEST_CASES = [
+  {
+    id: "job-list-page-check",
+    name: "任务列表",
+    passCriteria: "刷新 /#/data/job/list 页面后无报错",
+    status: "not-started",
+    detail: "目标页面：/#/data/job/list"
+  },
+  {
+    id: "datasource-add-entry-check",
+    name: "添加 MySQL 数据源",
+    passCriteria: "进入 /#/ccdatasource/add 后完成“自建+MySQL+关键字段填写”，并触发“新增数据源”提交",
+    status: "not-started",
+    detail: "目标页面：/#/ccdatasource/add"
+  },
+  {
+    id: "mysql-connection-check",
+    name: "测试 MySQL 链接",
+    passCriteria: "使用 mySqlDataSourceId_1 定位并执行测试连接，返回结果无错误信息",
+    status: "not-started",
+    detail: "目标页面：/#/ccdatasource（测试连接弹窗）"
+  }
+];
+let ccTestCases = cloneDefaultCcCases();
 
 document.addEventListener("DOMContentLoaded", () => {
   renderFeatureList();
   syncFeatureView();
   refreshHealth();
   refreshTaobaoTask();
+  refreshCcAutomationTask();
   taskPollTimer = window.setInterval(refreshTaobaoTask, 1500);
+  ccTaskPollTimer = window.setInterval(refreshCcAutomationTask, 1500);
 });
 
 window.addEventListener("beforeunload", () => {
   if (taskPollTimer) {
     window.clearInterval(taskPollTimer);
+  }
+  if (ccTaskPollTimer) {
+    window.clearInterval(ccTaskPollTimer);
+  }
+});
+
+ccClearButtonEl.addEventListener("click", async () => {
+  try {
+    ccClearButtonEl.disabled = true;
+    await sendRuntimeMessage({ type: "CLEAR_CC_AUTOMATION_TASK" });
+    ccTestCases = cloneDefaultCcCases();
+    renderCcCases(ccTestCases);
+    renderSummary([
+      `用例总数：${ccTestCases.length}`,
+      "通过数：0",
+      "未通过数：0"
+    ]);
+    setMessage("已重置测试状态");
+  } catch (error) {
+    setMessage(error.message || "清理测试状态失败");
+  } finally {
+    ccClearButtonEl.disabled = false;
   }
 });
 
@@ -110,14 +182,25 @@ buttonEl.addEventListener("click", async () => {
   buttonEl.disabled = true;
 
   try {
-    const response = await sendRuntimeMessage({
+    const message = {
       type: feature.messageType,
       keyword
-    });
+    };
+    if (feature.id === "cc-automation-test") {
+      message.siteUrl = keyword;
+    }
+
+    const response = await sendRuntimeMessage(message);
 
     if (feature.id === "taobao-guide") {
       setMessage("淘宝导购任务已启动，可关闭 popup 后稍后再看结果");
       await refreshTaobaoTask();
+      return;
+    }
+
+    if (feature.id === "cc-automation-test") {
+      setMessage("CC 自动化测试任务已启动");
+      await refreshCcAutomationTask();
       return;
     }
 
@@ -230,6 +313,7 @@ function clearResults() {
   renderBestItem(null);
   renderSummary([]);
   renderFunctions([]);
+  renderCcCases(ccTestCases);
   setMessage("");
 }
 
@@ -243,6 +327,7 @@ function getSelectedFeature() {
 
 function syncFeatureView() {
   const feature = getSelectedFeature();
+  const isCcAutomation = feature.id === "cc-automation-test";
   featureSelectEl.value = feature.id;
   featureDescriptionEl.textContent = feature.description || "";
   buttonEl.textContent = feature.actionLabel;
@@ -250,6 +335,22 @@ function syncFeatureView() {
   functionsTitleEl.textContent = feature.functionsTitle;
   featureInputSectionEl.classList.toggle("hidden", !feature.requiresInput);
   featureInputEl.placeholder = feature.inputPlaceholder || "";
+  if (feature.requiresInput && feature.defaultInputValue && !featureInputEl.value.trim()) {
+    featureInputEl.value = feature.defaultInputValue;
+  }
+  buttonEl.classList.remove("hidden");
+  summarySectionEl.classList.toggle("hidden", false);
+  functionsSectionEl.classList.toggle("hidden", isCcAutomation);
+  ccCasesSectionEl.classList.toggle("hidden", !isCcAutomation);
+  ccClearButtonEl.classList.toggle("hidden", !isCcAutomation);
+
+  if (isCcAutomation) {
+    renderBestItem(null);
+    renderCcCases(ccTestCases);
+    renderSummary(feature.emptySummary || []);
+    buttonEl.disabled = false;
+  }
+
   if (feature.id !== "taobao-guide") {
     buttonEl.disabled = false;
   }
@@ -258,6 +359,55 @@ function syncFeatureView() {
   if (label) {
     label.textContent = feature.inputLabel || "输入内容";
   }
+}
+
+function renderCcCases(cases) {
+  if (!Array.isArray(cases) || !cases.length) {
+    ccCasesListEl.innerHTML = '<li class="empty-item">暂无测试用例</li>';
+    return;
+  }
+
+  ccCasesListEl.innerHTML = cases.map((item) => {
+    const name = escapeHtml(item.name || item.title || "未命名用例");
+    const passCriteria = escapeHtml(item.passCriteria || item.detail || "");
+    const detail = escapeHtml(item.detail || "");
+    const status = normalizeCcStatus(item.status);
+    const statusText = getCcStatusText(status);
+    return `
+      <li class="cc-case-item">
+        <div class="cc-case-main">
+          <span class="cc-case-title">${name}</span>
+          <span class="cc-case-criteria">通过标准：${passCriteria || "未设置"}</span>
+          ${detail ? `<span class="cc-case-criteria">执行结果：${detail}</span>` : ""}
+        </div>
+        <span class="cc-case-status ${status}">${statusText}</span>
+      </li>
+    `;
+  }).join("");
+}
+
+function normalizeCcStatus(status) {
+  if (status === "passed") {
+    return "passed";
+  }
+  if (status === "failed") {
+    return "failed";
+  }
+  return "not-started";
+}
+
+function getCcStatusText(status) {
+  if (status === "passed") {
+    return "通过";
+  }
+  if (status === "failed") {
+    return "未通过";
+  }
+  return "未开始";
+}
+
+function cloneDefaultCcCases() {
+  return DEFAULT_CC_TEST_CASES.map((item) => ({ ...item }));
 }
 
 async function refreshTaobaoTask() {
@@ -302,6 +452,48 @@ async function refreshTaobaoTask() {
   }
 }
 
+async function refreshCcAutomationTask() {
+  try {
+    const response = await sendRuntimeMessage({ type: "GET_CC_AUTOMATION_TASK" });
+    const task = response.data;
+    if (!task || getSelectedFeature().id !== "cc-automation-test") {
+      return;
+    }
+
+    if (task.status === "running") {
+      buttonEl.disabled = true;
+      setMessage(task.message || "CC 自动化测试执行中...");
+      return;
+    }
+
+    buttonEl.disabled = false;
+
+    if (task.status === "completed" && task.result) {
+      const cases = Array.isArray(task.result.cases) ? task.result.cases : [];
+      ccTestCases = cases;
+      renderCcCases(ccTestCases);
+      const summaryLines = Array.isArray(task.result.summary) && task.result.summary.length
+        ? task.result.summary
+        : [
+        `用例总数：${ccTestCases.length}`,
+        `通过数：${ccTestCases.filter((item) => item.status === "passed").length}`,
+        `未通过数：${ccTestCases.filter((item) => item.status === "failed").length}`
+      ];
+      renderSummary(summaryLines);
+      setMessage(task.message || "CC 自动化测试执行完成");
+      return;
+    }
+
+    if (task.status === "failed") {
+      setMessage(task.error || task.message || "CC 自动化测试执行失败");
+    }
+  } catch (error) {
+    if (getSelectedFeature().id === "cc-automation-test") {
+      buttonEl.disabled = false;
+    }
+  }
+}
+
 function renderBestItem(item) {
   if (!item || !item.title) {
     bestItemSectionEl.classList.add("hidden");
@@ -320,7 +512,7 @@ function renderBestItem(item) {
 }
 
 function escapeHtml(text) {
-  return text
+  return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

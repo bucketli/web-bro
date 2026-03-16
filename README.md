@@ -19,6 +19,45 @@
 - `页面总结`：抓取当前网页并调用本地服务分析页面功能
 - `淘宝导购`：输入商品名后，自动抓取淘宝搜索第 1 页商品，将价格、付款人数、店铺和链接发给后端，由 AI 选出更优商品并自动跳转详情页
 - `羽雀文档优化`：输入优化目标，读取当前羽雀文档内容，交给后端 AI 优化，再自动回填编辑器并点击“更新”
+- `CC自动化测试`：执行 CC 页面自动化用例（任务列表、添加 MySQL 数据源、测试 MySQL 链接）
+
+## CC 自动化配置（MySQL）
+
+`CC自动化测试` 中“添加 MySQL 数据源”步骤读取以下配置文件：
+
+- [extension/cc-automation.config.json](/Users/johnli/tools/web-bro/extension/cc-automation.config.json)
+
+示例：
+
+```json
+{
+  "mysqlAdd": {
+    "deployTypeLabel": "自建",
+    "dbTypeLabel": "MySQL",
+    "host": "127.0.0.1",
+    "port": "3306",
+    "account": "origin",
+    "password": "123456",
+    "description": "自动测试添加"
+  }
+}
+```
+
+字段说明：
+
+- `deployTypeLabel`：部署类型单选文案（如 `自建`）
+- `dbTypeLabel`：数据库类型单选文案（如 `MySQL`）
+- `host`：网络地址（IP/域名）
+- `port`：端口
+- `account`：账号
+- `password`：密码
+- `description`：描述
+
+使用方式：
+
+1. 测试同学先编辑 `extension/cc-automation.config.json`
+2. 重新加载扩展（`chrome://extensions/` 中点击刷新）
+3. 在 popup 执行 `CC自动化测试`
 
 ## 目录结构
 
