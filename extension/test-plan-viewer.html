@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC 自动化测试规划</title>
+<style>
+  :root {
+    --bg: #f5f6fa;
+    --card: #fff;
+    --border: #e4e7ed;
+    --text: #303133;
+    --muted: #909399;
+    --primary: #409eff;
+    --success: #67c23a;
+    --warning: #e6a23c;
+    --danger: #f56c6c;
+    --shadow: 0 2px 12px rgba(0,0,0,.06);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.7;
+  }
+
+  header {
+    background: #fff;
+    border-bottom: 1px solid var(--border);
+    padding: 0 32px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    height: 56px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: var(--shadow);
+  }
+
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .subtitle { color: var(--muted); font-size: 13px; }
+
+  .stats {
+    margin-left: auto;
+    display: flex;
+    gap: 20px;
+    font-size: 13px;
+  }
+  .stat { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: background .15s; }
+  .stat:hover { background: var(--bg); }
+  .stat.active-filter { background: #ecf5ff; }
+  .stat-badge {
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .stat-badge.done   { background: #f0f9eb; color: var(--success); }
+  .stat-badge.todo   { background: #fdf6ec; color: var(--warning); }
+  .stat-badge.skip   { background: #f4f4f5; color: var(--muted); }
+
+  .toolbar {
+    padding: 16px 32px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .search-input {
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    outline: none;
+    width: 260px;
+    background: #fff;
+    color: var(--text);
+    transition: border-color .2s;
+  }
+  .search-input:focus { border-color: var(--primary); }
+
+  .filter-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    transition: all .2s;
+  }
+  .filter-btn:hover { border-color: var(--primary); color: var(--primary); }
+  .filter-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+  .content {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 32px 48px;
+  }
+
+  .section-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 20px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .section-title {
+    padding: 14px 20px;
+    font-size: 15px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    background: #fafbfc;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .subsection-title {
+    padding: 10px 20px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    background: #f9f9fb;
+    border-bottom: 1px solid #f0f0f2;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  th {
+    text-align: left;
+    padding: 10px 16px;
+    background: #fafbfc;
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid #f0f2f5;
+    vertical-align: top;
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #fafcff; }
+
+  tr.hidden { display: none; }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    font-weight: 500;
+  }
+  .status.done { background: #f0f9eb; color: var(--success); }
+  .status.todo { background: #fdf6ec; color: var(--warning); }
+  .status.skip { background: #f4f4f5; color: var(--muted); }
+
+  code {
+    background: #f0f2f5;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    color: #c0392b;
+  }
+
+  .dep-tag {
+    display: inline-block;
+    font-size: 11px;
+    background: #ecf5ff;
+    color: var(--primary);
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-left: 4px;
+  }
+
+  .no-results {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  .priority-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 20px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .priority-title {
+    padding: 12px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    background: #fafbfc;
+  }
+  .priority-body {
+    padding: 12px 20px;
+  }
+  .priority-body ul {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 0;
+  }
+  .priority-body li code {
+    font-size: 12px;
+  }
+  .priority-desc {
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: 6px;
+  }
+
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .summary-item {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    box-shadow: var(--shadow);
+    text-align: center;
+  }
+  .summary-num { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+  .summary-num.done { color: var(--success); }
+  .summary-num.todo { color: var(--warning); }
+  .summary-num.skip { color: var(--muted); }
+  .summary-num.total { color: var(--primary); }
+  .summary-label { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CC 自动化测试规划</h1>
+  <span class="subtitle">基于 clouddm-web 路由和功能分析</span>
+  <div class="stats">
+    <div class="stat" data-filter="done" title="点击过滤">
+      <span>✅ 已实现</span>
+      <span class="stat-badge done" id="cnt-done">0</span>
+    </div>
+    <div class="stat" data-filter="todo" title="点击过滤">
+      <span>🔲 待实现</span>
+      <span class="stat-badge todo" id="cnt-todo">0</span>
+    </div>
+    <div class="stat" data-filter="skip" title="点击过滤">
+      <span>⏭️ 暂不实现</span>
+      <span class="stat-badge skip" id="cnt-skip">0</span>
+    </div>
+  </div>
+</header>
+
+<div class="toolbar">
+  <input class="search-input" id="search" type="text" placeholder="搜索用例 ID / 名称 / 说明...">
+  <button class="filter-btn active" data-filter="all">全部</button>
+  <button class="filter-btn" data-filter="done">✅ 已实现</button>
+  <button class="filter-btn" data-filter="todo">🔲 待实现</button>
+  <button class="filter-btn" data-filter="skip">⏭️ 暂不实现</button>
+</div>
+
+<div class="content" id="content"></div>
+
+<script src="test-plan-viewer.js"></script>
+</body>
+</html>

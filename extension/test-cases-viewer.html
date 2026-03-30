@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC 自动化测试用例</title>
+<style>
+  :root {
+    --bg: #f5f6fa;
+    --card: #fff;
+    --border: #e4e7ed;
+    --text: #303133;
+    --muted: #909399;
+    --primary: #409eff;
+    --success: #67c23a;
+    --warning: #e6a23c;
+    --danger: #f56c6c;
+    --disabled-bg: #f5f7fa;
+    --disabled-text: #c0c4cc;
+    --tag-bg: #ecf5ff;
+    --tag-text: #409eff;
+    --shadow: 0 2px 12px rgba(0,0,0,.06);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  header {
+    background: #fff;
+    border-bottom: 1px solid var(--border);
+    padding: 0 32px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    height: 56px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: var(--shadow);
+  }
+
+  header h1 { font-size: 18px; font-weight: 600; color: var(--text); }
+  header .subtitle { color: var(--muted); font-size: 13px; }
+
+  .stats {
+    margin-left: auto;
+    display: flex;
+    gap: 20px;
+    font-size: 13px;
+  }
+
+  .stat { display: flex; align-items: center; gap: 6px; }
+  .stat-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .stat-dot.active { background: var(--success); }
+  .stat-dot.disabled { background: var(--disabled-text); }
+
+  .toolbar {
+    padding: 16px 32px 0;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .search-input {
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    outline: none;
+    width: 240px;
+    background: #fff;
+    color: var(--text);
+    transition: border-color .2s;
+  }
+  .search-input:focus { border-color: var(--primary); }
+
+  .filter-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    transition: all .2s;
+  }
+  .filter-btn:hover { border-color: var(--primary); color: var(--primary); }
+  .filter-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+  .expand-btn {
+    margin-left: auto;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .expand-btn:hover { color: var(--primary); border-color: var(--primary); }
+
+  main {
+    padding: 16px 32px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .case-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    transition: box-shadow .2s;
+  }
+  .case-card:hover { box-shadow: 0 4px 20px rgba(0,0,0,.1); }
+  .case-card.disabled {
+    background: var(--disabled-bg);
+    border-color: #dcdfe6;
+    opacity: .75;
+  }
+
+  .case-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .case-header:hover { background: rgba(64,158,255,.04); }
+
+  .case-status-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  }
+  .case-status-dot.active { background: var(--success); }
+  .case-status-dot.disabled { background: var(--disabled-text); }
+
+  .case-name {
+    font-weight: 600;
+    font-size: 14px;
+    flex: 1;
+  }
+
+  .case-id {
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg);
+    padding: 2px 8px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .badge-disabled { background: #f0f2f5; color: var(--disabled-text); }
+  .badge-steps { background: var(--tag-bg); color: var(--tag-text); }
+  .badge-dep { background: #fdf6ec; color: var(--warning); }
+
+  .chevron {
+    width: 16px; height: 16px; flex-shrink: 0;
+    color: var(--muted);
+    transition: transform .2s;
+  }
+  .case-card.open .chevron { transform: rotate(90deg); }
+
+  .case-body {
+    display: none;
+    border-top: 1px solid var(--border);
+  }
+  .case-card.open .case-body { display: block; }
+
+  .meta-section {
+    padding: 14px 18px 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .meta-item { display: flex; flex-direction: column; gap: 3px; min-width: 160px; }
+  .meta-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .meta-value { font-size: 13px; color: var(--text); }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    background: var(--tag-bg);
+    color: var(--tag-text);
+    font-family: monospace;
+  }
+  .tag.provides { background: #f0f9eb; color: #67c23a; }
+  .tag.requires { background: #fdf6ec; color: #e6a23c; }
+  .tag.dep { background: #fef0f0; color: #f56c6c; }
+
+  .steps-section {
+    padding: 14px 18px 18px;
+  }
+
+  .steps-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    margin-bottom: 10px;
+  }
+
+  .steps-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .step-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+
+  .step-index {
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 20px;
+    text-align: right;
+    padding-top: 1px;
+    flex-shrink: 0;
+  }
+
+  .step-type-badge {
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: monospace;
+    flex-shrink: 0;
+  }
+
+  .step-params {
+    color: var(--text);
+    flex: 1;
+    line-height: 1.5;
+  }
+
+  .step-param-key { color: var(--muted); }
+  .step-param-val { color: var(--text); font-family: monospace; }
+  .step-param-var { color: #9b59b6; }
+
+  /* Step type colors */
+  .type-navigate    { background: #edf2fc; color: #5c6bc0; }
+  .type-reload      { background: #fdf6ec; color: #e6a23c; }
+  .type-wait        { background: #f5f5f5; color: #909399; }
+  .type-click       { background: #ecf5ff; color: #409eff; }
+  .type-fill        { background: #f0f9eb; color: #67c23a; }
+  .type-select      { background: #f0f9eb; color: #67c23a; }
+  .type-assert      { background: #fef0f0; color: #f56c6c; }
+  .type-wait_for    { background: #f5f0fe; color: #9b59b6; }
+  .type-intercept   { background: #fdf6ec; color: #e6a23c; }
+  .type-extract     { background: #fdf6ec; color: #e6a23c; }
+  .type-inject      { background: #f5f5f5; color: #606266; }
+  .type-find        { background: #ecf5ff; color: #409eff; }
+  .type-close       { background: #fef0f0; color: #f56c6c; }
+  .type-other       { background: #f5f5f5; color: #606266; }
+
+  .no-results {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+    font-size: 15px;
+  }
+
+  .group-label {
+    padding: 8px 0 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CC 自动化测试用例</h1>
+  <span class="subtitle">Step DSL 测试框架</span>
+  <div class="stats">
+    <span class="stat"><span class="stat-dot active"></span><span id="stat-active">0</span> 个启用</span>
+    <span class="stat"><span class="stat-dot disabled"></span><span id="stat-disabled">0</span> 个禁用</span>
+    <span class="stat" style="color:var(--muted)">共 <span id="stat-total">0</span> 个用例</span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <input class="search-input" id="search" placeholder="搜索用例名称 / ID / 步骤类型…" oninput="renderCases()">
+  <button class="filter-btn active" id="filter-all" onclick="setFilter('all')">全部</button>
+  <button class="filter-btn" id="filter-active" onclick="setFilter('active')">启用</button>
+  <button class="filter-btn" id="filter-disabled" onclick="setFilter('disabled')">禁用</button>
+  <button class="expand-btn" onclick="toggleAll()">全部展开 / 折叠</button>
+</div>
+
+<main id="main"></main>
+
+<script src="test-cases-viewer.js"></script>
+</body>
+</html>

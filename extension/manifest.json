@@ -35,7 +35,8 @@
     {
       "resources": [
         "page-hook.js",
-        "cc-automation.config.json"
+        "cc-automation.config.json",
+        "cc-test-cases.json"
       ],
       "matches": [
         "<all_urls>"
