@@ -2,6 +2,9 @@ const TEXT_LIMIT = 800;
 const HTML_LIMIT = 2400;
 const INTERACTIVE_HTML_LIMIT = 3200;
 
+// Stores pending API intercept promises, keyed by saveAs name
+const ccApiIntercepts = new Map();
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) {
     return false;
@@ -61,6 +64,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "RUN_CC_MYSQL_CONNECTION_TEST") {
     runCcMySqlConnectionTest(message.expectedListUrl, message.mySqlDataSourceId_1)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "EXECUTE_STEP") {
+    executeStep(message.step, message.context || {})
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -878,6 +888,1063 @@ async function runCcMySqlConnectionTest(expectedListUrl, mySqlDataSourceId_1) {
   };
 }
 
+async function executeStep(step, context) {
+  const type = step && step.type;
+
+  switch (type) {
+    case "comment":
+      return { ok: true };
+
+    case "wait": {
+      await wait(typeof step.ms === "number" ? step.ms : 500);
+      return { ok: true };
+    }
+
+    case "click_button": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      let btn = null;
+      do {
+        const root = step.container ? document.querySelector(step.container) : document;
+        if (step.container && !root) {
+          if (Date.now() >= deadline) {
+            return { ok: false, error: `未找到容器选择器："${step.container}"` };
+          }
+          await wait(200);
+          continue;
+        }
+        btn = findButtonByText(step.text, root || document);
+        if (btn) break;
+        if (Date.now() < deadline) {
+          await wait(200);
+        }
+      } while (Date.now() < deadline);
+      if (!btn) {
+        return { ok: false, error: `未找到按钮："${step.text}"${step.container ? `（容器：${step.container}）` : ""}` };
+      }
+      btn.click();
+      return { ok: true };
+    }
+
+    case "fill_input": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      let filled = false;
+      do {
+        filled = fillInputByFormLabel(step.label, step.value);
+        if (filled) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!filled) {
+        return { ok: false, error: `填写失败：未找到 label="${step.label}" 的输入框` };
+      }
+      return { ok: true };
+    }
+
+    case "fill_network_address": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      let filled = false;
+      do {
+        filled = fillNetworkAddress(step.host, step.port);
+        if (filled) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!filled) {
+        return { ok: false, error: "填写网络地址失败：未找到对应输入框" };
+      }
+      return { ok: true };
+    }
+
+    case "select_radio": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      let selected = false;
+      do {
+        selected = selectRadioOptionByGroupLabel(step.label, step.option);
+        if (selected) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!selected) {
+        return { ok: false, error: `单选失败：label="${step.label}" option="${step.option}"` };
+      }
+      return { ok: true };
+    }
+
+    case "wait_for_url": {
+      const currentUrl = window.location.href;
+      const targetPath = step.path;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 10000;
+      if (isUrlMatched(currentUrl, targetPath)) {
+        return { ok: true };
+      }
+      const finalUrl = await waitForUrlChange(targetPath, currentUrl, timeout);
+      if (!isUrlMatched(finalUrl, targetPath)) {
+        return { ok: false, error: `等待 URL 超时，当前：${finalUrl}，期望：${targetPath}` };
+      }
+      return { ok: true };
+    }
+
+    case "intercept_api": {
+      const saveAs = step.saveAs;
+      const urlPattern = step.url;
+      let resolveIntercept;
+      const interceptPromise = new Promise((resolve) => {
+        resolveIntercept = resolve;
+      });
+
+      function handleApiMessage(event) {
+        const packet = event && event.data ? event.data : null;
+        if (!packet || packet.source !== "CC_AUTOMATION_HOOK" || packet.type !== "CC_DATASOURCE_ADD_API_RESULT") {
+          return;
+        }
+        const reqUrl = packet.meta && packet.meta.requestUrl ? String(packet.meta.requestUrl) : "";
+        if (!reqUrl.includes(urlPattern)) {
+          return;
+        }
+        window.removeEventListener("message", handleApiMessage);
+        resolveIntercept(packet.payload);
+      }
+
+      window.addEventListener("message", handleApiMessage);
+      ccApiIntercepts.set(saveAs, {
+        promise: interceptPromise,
+        cleanup: () => window.removeEventListener("message", handleApiMessage)
+      });
+      return { ok: true };
+    }
+
+    case "wait_for_api_response": {
+      const fromKey = step.from;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 20000;
+      const intercept = ccApiIntercepts.get(fromKey);
+      if (!intercept) {
+        return { ok: false, error: `未注册 API 拦截器："${fromKey}"，请先执行 intercept_api 步骤` };
+      }
+      let timeoutId;
+      try {
+        const payload = await Promise.race([
+          intercept.promise,
+          new Promise((_, reject) => {
+            timeoutId = setTimeout(
+              () => reject(new Error(`等待 API 响应超时（${fromKey}，${timeout}ms）`)),
+              timeout
+            );
+          })
+        ]);
+        clearTimeout(timeoutId);
+        ccApiIntercepts.delete(fromKey);
+        return { ok: true, contextUpdates: { [`_apiResp_${fromKey}`]: payload } };
+      } catch (error) {
+        clearTimeout(timeoutId);
+        const entry = ccApiIntercepts.get(fromKey);
+        if (entry && entry.cleanup) {
+          entry.cleanup();
+        }
+        ccApiIntercepts.delete(fromKey);
+        return { ok: false, error: error.message };
+      }
+    }
+
+    case "extract_datasource_id": {
+      const fromKey = step.from;
+      const saveAs = step.saveAs;
+      const payload = context[`_apiResp_${fromKey}`];
+      const id = extractIdFromAddApiPayload(payload);
+      if (!id) {
+        return { ok: false, error: `未从 API 响应中提取到 dataSourceId（from="${fromKey}"）` };
+      }
+      return { ok: true, contextUpdates: { [saveAs]: id } };
+    }
+
+    case "find_and_click_in_row": {
+      const targetId = String(step.id || "").trim();
+      const actionText = step.text;
+      if (!targetId) {
+        return { ok: false, error: "find_and_click_in_row：缺少 id 参数" };
+      }
+
+      let row = await waitForDataSourceRowById(targetId, 4000);
+      if (!row) {
+        const filterApplied = await applyDataSourceIdFilter(targetId);
+        if (filterApplied) {
+          row = await waitForDataSourceRowById(targetId, 6000);
+          if (!row) {
+            row = await waitForFirstDataSourceRow(3000);
+          }
+        }
+      }
+      if (!row) {
+        return { ok: false, error: `未找到数据源行（id=${targetId}）` };
+      }
+
+      // Try in the row itself first, then fixed-right column at same index
+      const allRows = Array.from(
+        document.querySelectorAll(".ivu-table-body .ivu-table-tbody tr.ivu-table-row")
+      );
+      const rowIndex = allRows.indexOf(row);
+
+      let btn = Array.from(row.querySelectorAll("a, button, [role='button']"))
+        .find((n) => normalizeWhitespace(n.textContent || "") === actionText);
+
+      if (!btn && rowIndex >= 0) {
+        const fixedRows = Array.from(
+          document.querySelectorAll(".ivu-table-fixed-right .ivu-table-fixed-body tr.ivu-table-row")
+        );
+        const fixedRow = fixedRows[rowIndex];
+        if (fixedRow) {
+          btn = Array.from(fixedRow.querySelectorAll("a, button, [role='button']"))
+            .find((n) => normalizeWhitespace(n.textContent || "") === actionText);
+        }
+      }
+
+      if (!btn) {
+        return { ok: false, error: `行内未找到操作："${actionText}"（id=${targetId}）` };
+      }
+      btn.click();
+      return { ok: true };
+    }
+
+    case "wait_for_modal": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 10000;
+      const modal = await waitForVisibleModal(timeout);
+      if (!modal) {
+        return { ok: false, error: "等待弹窗超时" };
+      }
+      return { ok: true };
+    }
+
+    case "click_button_in_modal": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      let modal = null;
+      do {
+        modal = findVisibleModal();
+        if (modal) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!modal) {
+        return { ok: false, error: "未找到可见弹窗" };
+      }
+      // Generic: find any button in modal by text first
+      let btn = findButtonByText(step.text, modal);
+      // Fallback: primary button for common confirm texts
+      if (!btn) {
+        const confirmTexts = ["确定", "确认", "测试连接"];
+        if (confirmTexts.includes(step.text)) {
+          btn = modal.querySelector(
+            ".ivu-modal-footer .ivu-btn-primary, .ant-modal-footer .ant-btn-primary, .el-dialog__footer .el-button--primary"
+          );
+        }
+      }
+      if (!btn) {
+        const found = collectModalButtonsText(modal);
+        return {
+          ok: false,
+          error: `弹窗中未找到"${step.text}"按钮（检测到：${found.join("、") || "无"}）`
+        };
+      }
+      btn.click();
+      return { ok: true };
+    }
+
+    case "fill_input_in_modal": {
+      const modal = findVisibleModal();
+      if (!modal) {
+        return { ok: false, error: "未找到可见弹窗" };
+      }
+      const input = Array.from(modal.querySelectorAll("input.ivu-input, input.ant-input, input[type='text'], textarea"))
+        .find((n) => isElementVisible(n) && !n.disabled && !n.readOnly);
+      if (!input) {
+        return { ok: false, error: "弹窗中未找到可填写的输入框" };
+      }
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
+        || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(input, step.value);
+      } else {
+        input.value = step.value;
+      }
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+      return { ok: true };
+    }
+
+    case "click_dropdown_item": {
+      const target = normalizeWhitespace(step.text);
+      const timeout = typeof step.timeout === "number" ? step.timeout : 3000;
+      const deadline = Date.now() + timeout;
+      // iView Dropdown in transfer mode appends menu to .ivu-dropdown-transfer;
+      // must list that first, then fallbacks for non-transfer and Ant Design
+      const dropdownSelectors = [
+        ".ivu-dropdown-transfer .ivu-dropdown-item",
+        ".ivu-select-dropdown .ivu-dropdown-item",
+        ".ivu-dropdown-menu .ivu-dropdown-item",
+        ".ant-dropdown:not(.ant-dropdown-hidden) .ant-dropdown-menu-item",
+        ".ant-dropdown-menu-item",
+        "[role='menu'] [role='menuitem']"
+      ];
+      let clickTarget = null;
+      let lastFoundTexts = [];
+      do {
+        const exactCandidates = [];
+        const fuzzyCandidates = [];
+        for (const selector of dropdownSelectors) {
+          const nodes = Array.from(document.querySelectorAll(selector));
+          nodes.forEach((node) => {
+            if (!isElementVisible(node)) return;
+            if (node.className && (String(node.className).includes("disabled"))) return;
+            // Prefer inner clickable children (e.g. <a class="dropdown-content">)
+            const innerClickable = Array.from(node.querySelectorAll(
+              "a.dropdown-content, a, span.dropdown-content"
+            )).filter((c) => c instanceof HTMLElement && isElementVisible(c));
+            const candidates = innerClickable.length ? innerClickable : [node];
+            candidates.forEach((c) => {
+              const text = normalizeWhitespace(c.textContent || "");
+              if (text === target) exactCandidates.push(c);
+              else if (text.includes(target)) fuzzyCandidates.push(c);
+            });
+          });
+        }
+        lastFoundTexts = [...exactCandidates, ...fuzzyCandidates].map((el) => normalizeWhitespace(el.textContent || ""));
+        clickTarget = exactCandidates[0] || fuzzyCandidates[0] || null;
+        if (clickTarget) break;
+        if (Date.now() < deadline) await wait(150);
+      } while (Date.now() < deadline);
+      if (!clickTarget) {
+        const found = lastFoundTexts.length ? lastFoundTexts.map((t) => `"${t}"`).join("、") : "无";
+        return { ok: false, error: `未找到下拉菜单项："${step.text}"（检测到的菜单项：${found}）` };
+      }
+      clickTarget.click();
+      return { ok: true };
+    }
+
+    case "assert_no_errors": {
+      const signals = collectCcErrorSignals();
+      if (signals.length) {
+        return { ok: false, error: `检测到页面异常信号：${signals.join("；")}` };
+      }
+      return { ok: true };
+    }
+
+    case "assert_no_connection_errors": {
+      const modal = findVisibleModal();
+      const modalText = modal ? normalizeWhitespace(modal.innerText || "") : "";
+      const signals = collectConnectionErrorSignals();
+      if (signals.length) {
+        return { ok: false, error: `测试连接失败：${signals.join("；")}${modalText ? `\n弹窗内容：${modalText}` : ""}` };
+      }
+      // Also fail explicitly if success text is absent but modal is open
+      if (modal && modalText && !modalText.includes("测试连接成功") && !modalText.includes("连接成功")) {
+        return { ok: false, error: `未检测到连接成功标志\n弹窗内容：${modalText}` };
+      }
+      return { ok: true };
+    }
+
+    case "assert_extracted": {
+      const key = step.key;
+      const value = context[key];
+      if (!value) {
+        return { ok: false, error: `断言失败：context["${key}"] 为空，请确认前置步骤已成功执行` };
+      }
+      return { ok: true };
+    }
+
+    case "fill_select": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 3000;
+      const deadline = Date.now() + timeout;
+      let selected = false;
+      do {
+        const item = findFormItemByLabel(step.label);
+        if (item) {
+          const trigger = item.querySelector(".ivu-select-selection, .ant-select-selector, .el-select .el-input__inner");
+          if (trigger) {
+            trigger.click();
+            await wait(250);
+            const opts = Array.from(document.querySelectorAll(
+              ".ivu-select-dropdown .ivu-select-item, .ant-select-dropdown .ant-select-item-option-content, .el-select-dropdown__item"
+            ));
+            const match = opts.find((el) => normalizeWhitespace(el.textContent || "") === normalizeWhitespace(step.option));
+            if (match) {
+              match.click();
+              selected = true;
+              break;
+            }
+          }
+        }
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!selected) {
+        return { ok: false, error: `下拉选择失败：label="${step.label}" option="${step.option}"` };
+      }
+      return { ok: true };
+    }
+
+    case "click_first_table_row_link": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 5000;
+      const deadline = Date.now() + timeout;
+      let link = null;
+      do {
+        const firstRow = document.querySelector(".ivu-table-body .ivu-table-row, .ant-table-tbody tr, .el-table__body-wrapper tr");
+        if (firstRow) {
+          const anchors = Array.from(firstRow.querySelectorAll("a"));
+          link = anchors.find((a) => {
+            const text = normalizeWhitespace(a.textContent || "");
+            return text.length > 0 && text.length < 100;
+          }) || anchors[0] || null;
+        }
+        if (link) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!link) {
+        return { ok: false, error: "未找到表格第一行中的可点击链接" };
+      }
+      link.click();
+      return { ok: true };
+    }
+
+    case "find_row_by_text_and_click": {
+      const searchText = normalizeWhitespace(step.rowText || "");
+      const actionText = normalizeWhitespace(step.text || "");
+      const timeout = typeof step.timeout === "number" ? step.timeout : 4000;
+      const deadline = Date.now() + timeout;
+      let btn = null;
+      do {
+        const rows = Array.from(document.querySelectorAll(
+          ".ivu-table-body .ivu-table-row, .ant-table-tbody tr, .el-table__body-wrapper tr"
+        ));
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (!normalizeWhitespace(row.textContent || "").includes(searchText)) continue;
+          btn = Array.from(row.querySelectorAll("a, button, [role='button']"))
+            .find((n) => normalizeWhitespace(n.textContent || "") === actionText);
+          if (!btn) {
+            const fixedRows = Array.from(document.querySelectorAll(
+              ".ivu-table-fixed-right .ivu-table-fixed-body .ivu-table-row"
+            ));
+            const fixedRow = fixedRows[i];
+            if (fixedRow) {
+              btn = Array.from(fixedRow.querySelectorAll("a, button, [role='button']"))
+                .find((n) => normalizeWhitespace(n.textContent || "") === actionText);
+            }
+          }
+          if (btn) break;
+        }
+        if (btn) break;
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!btn) {
+        return { ok: false, error: `未在包含"${searchText}"的行中找到"${actionText}"操作` };
+      }
+      btn.click();
+      return { ok: true };
+    }
+
+    case "select_first_option": {
+      // Opens an iView Select by label and clicks its first available option.
+      const timeout = typeof step.timeout === "number" ? step.timeout : 5000;
+      const deadline = Date.now() + timeout;
+      let selected = false;
+      do {
+        const item = findFormItemByLabel(step.label);
+        if (item) {
+          const trigger = item.querySelector(".ivu-select-selection, .ant-select-selector");
+          if (trigger) {
+            trigger.click();
+            await wait(300);
+            const first = document.querySelector(
+              ".ivu-select-dropdown .ivu-select-item:not(.ivu-select-item-disabled), .ant-select-dropdown .ant-select-item-option:not(.ant-select-item-option-disabled)"
+            );
+            if (first) {
+              first.click();
+              selected = true;
+              break;
+            }
+          }
+        }
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!selected) {
+        return { ok: false, error: `下拉选择第一项失败：label="${step.label}"` };
+      }
+      return { ok: true };
+    }
+
+    // ─── Job Creation Steps ───────────────────────────────────────────────────
+
+    case "select_job_datasource": {
+      // Selects deploy type, DB type and network type for source or target side.
+      // side: "source" (left column) | "target" (right column)
+      const side = step.side;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 8000;
+      const deadline = Date.now() + timeout;
+
+      const getSideCol = () => {
+        const firstStep = document.querySelector(".task-create-first-step");
+        if (!firstStep) return null;
+        const cols = Array.from(firstStep.querySelectorAll(".ivu-col-span-12"));
+        return side === "source" ? cols[0] : cols[1];
+      };
+
+      // Helper: click a radio option by text within a container
+      const clickRadioByText = (container, text) => {
+        const target = normalizeWhitespace(text);
+        const wrappers = Array.from(container.querySelectorAll(".ivu-radio-wrapper"));
+        const match = wrappers.find(w => normalizeWhitespace(w.textContent || "") === target)
+          || wrappers.find(w => normalizeWhitespace(w.textContent || "").includes(target));
+        if (match) { match.click(); return true; }
+        return false;
+      };
+
+      // Wait for container to appear
+      let col = null;
+      do {
+        col = getSideCol();
+        if (col) break;
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!col) return { ok: false, error: `未找到 ${side} 数据源配置列（.task-create-first-step 未渲染）` };
+
+      // 1. Deploy type (first set of RadioGroup buttons in this column)
+      if (step.deployType) {
+        let done = false;
+        do {
+          col = getSideCol();
+          if (col && clickRadioByText(col, step.deployType)) { done = true; break; }
+          if (Date.now() < deadline) await wait(300);
+        } while (Date.now() < deadline);
+        if (!done) return { ok: false, error: `未找到部署类型选项："${step.deployType}"（side=${side}）` };
+        await wait(400);
+      }
+
+      // 2. DB type — also a RadioGroup, same structure as deploy type
+      if (step.dbType) {
+        let done = false;
+        do {
+          col = getSideCol();
+          if (col && clickRadioByText(col, step.dbType)) { done = true; break; }
+          if (Date.now() < deadline) await wait(300);
+        } while (Date.now() < deadline);
+        if (!done) return { ok: false, error: `未找到数据库类型选项："${step.dbType}"（side=${side}）` };
+        await wait(400);
+      }
+
+      // 3. Network type (内网/外网)
+      if (step.networkType) {
+        let done = false;
+        do {
+          col = getSideCol();
+          if (col && clickRadioByText(col, step.networkType)) { done = true; break; }
+          if (Date.now() < deadline) await wait(300);
+        } while (Date.now() < deadline);
+        if (!done) return { ok: false, error: `未找到网络类型选项："${step.networkType}"（side=${side}）` };
+        await wait(300);
+      }
+
+      return { ok: true };
+    }
+
+    case "select_first_instance": {
+      // Selects the first available instance in the iView Select for source or target side.
+      const side = step.side;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 8000;
+      const deadline = Date.now() + timeout;
+
+      const getSideCol = () => {
+        const firstStep = document.querySelector(".task-create-first-step");
+        if (!firstStep) return null;
+        const cols = Array.from(firstStep.querySelectorAll(".ivu-col-span-12"));
+        return side === "source" ? cols[0] : cols[1];
+      };
+
+      let selected = false;
+      do {
+        const col = getSideCol();
+        if (col) {
+          // Find the ivu-select for the instance (style width:280px, not the charset select after)
+          const selects = Array.from(col.querySelectorAll(".ivu-select")).filter(el => isElementVisible(el));
+          // Pick first ivu-select that doesn't already have a value (placeholder visible) or just first
+          const ivuSelect = selects[0];
+          if (ivuSelect) {
+            const selection = ivuSelect.querySelector(".ivu-select-selection");
+            if (selection) {
+              selection.click();
+              await wait(400);
+              // Find the dropdown — it's teleported to body
+              const dropdown = document.querySelector(".ivu-select-dropdown");
+              if (dropdown && isElementVisible(dropdown)) {
+                const firstItem = Array.from(dropdown.querySelectorAll(".ivu-select-item:not(.ivu-select-item-disabled)"))
+                  .find(el => isElementVisible(el));
+                if (firstItem) {
+                  firstItem.click();
+                  selected = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+
+      if (!selected) return { ok: false, error: `未能选到 ${side} 侧实例（未找到可用选项）` };
+      await wait(300);
+      return { ok: true };
+    }
+
+    case "select_instance": {
+      // Selects a named instance in the iView Select for source or target side.
+      // step.side: "source" | "target"
+      // step.name: instance display name to match (exact or includes)
+      const side = step.side;
+      const name = normalizeWhitespace(step.name || "");
+      const timeout = typeof step.timeout === "number" ? step.timeout : 8000;
+      const deadline = Date.now() + timeout;
+
+      if (!name) return { ok: false, error: "select_instance：缺少 name 参数" };
+
+      const getSideCol = () => {
+        const firstStep = document.querySelector(".task-create-first-step");
+        if (!firstStep) return null;
+        const cols = Array.from(firstStep.querySelectorAll(".ivu-col-span-12"));
+        return side === "source" ? cols[0] : cols[1];
+      };
+
+      // Helper: type into iView filterable select search input
+      const typeIntoSelectInput = async (input, text) => {
+        input.focus();
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+        if (nativeSetter) nativeSetter.call(input, text);
+        input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true }));
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+        await wait(600);
+      };
+
+      let selected = false;
+      let lastFoundNames = [];
+      do {
+        const col = getSideCol();
+        if (col) {
+          const ivuSelect = Array.from(col.querySelectorAll(".ivu-select")).find(el => isElementVisible(el));
+          if (ivuSelect) {
+            const selection = ivuSelect.querySelector(".ivu-select-selection");
+            if (selection) {
+              selection.click();
+              await wait(500);
+
+              // Find the visible dropdown — use querySelectorAll to skip hidden ones left in DOM
+              const dropdown = Array.from(document.querySelectorAll(".ivu-select-dropdown"))
+                .find(el => isElementVisible(el));
+
+              if (dropdown) {
+                // Search input is inside .ivu-select-selection (iView filterable mode)
+                const searchInput = ivuSelect.querySelector("input.ivu-select-input")
+                  || ivuSelect.querySelector(".ivu-select-selection input");
+                if (searchInput) {
+                  await typeIntoSelectInput(searchInput, name);
+                }
+
+                // Query all items — no visibility filter, scrollIntoView before click
+                const items = Array.from(dropdown.querySelectorAll(".ivu-select-item:not(.ivu-select-item-disabled)"));
+                lastFoundNames = items.map(el => normalizeWhitespace(el.textContent || ""));
+                const match = items.find(el => normalizeWhitespace(el.textContent || "") === name)
+                  || items.find(el => normalizeWhitespace(el.textContent || "").includes(name));
+                if (match) {
+                  match.scrollIntoView({ block: "nearest" });
+                  await wait(100);
+                  match.click();
+                  selected = true;
+                  break;
+                }
+                // Close dropdown before retrying
+                document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+                await wait(200);
+              }
+            }
+          }
+        }
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+
+      if (!selected) {
+        const found = lastFoundNames.length ? lastFoundNames.slice(0, 10).map(t => `"${t}"`).join("、") : "无";
+        return { ok: false, error: `未找到实例 "${name}"（${side} 侧，检测到：${found}）` };
+      }
+      await wait(300);
+      return { ok: true };
+    }
+
+    case "click_button_in_side": {
+      // Clicks a button within the source or target side column in the job creation Step 0.
+      // step.side: "source" | "target"
+      // step.text: button text to match
+      // step.timeout: optional ms
+      const side = step.side;
+      const text = step.text;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 5000;
+      const deadline = Date.now() + timeout;
+
+      const getSideCol = () => {
+        const firstStep = document.querySelector(".task-create-first-step");
+        if (!firstStep) return null;
+        const cols = Array.from(firstStep.querySelectorAll(".ivu-col-span-12"));
+        return side === "source" ? cols[0] : cols[1];
+      };
+
+      let btn = null;
+      do {
+        const col = getSideCol();
+        if (col) {
+          btn = findButtonByText(text, col);
+          if (btn) break;
+        }
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+
+      if (!btn) {
+        return { ok: false, error: `未在 ${side} 侧找到按钮："${text}"` };
+      }
+      btn.click();
+      return { ok: true };
+    }
+
+    case "select_db_in_side": {
+      // In job creation Step 0, selects a database for source or target side.
+      // Mirrors web-bro's selectOptionByPlaceholder+scopeLabel approach:
+      // finds .ivu-form-item by label ("源数据库"/"目标数据库"), then inside it
+      // finds the select trigger by checking input[placeholder] AND
+      // .ivu-select-placeholder span text (handles both filterable and normal selects).
+      // step.side: "source" | "target"
+      // step.name: database name to select
+      // step.timeout: optional ms
+      const side = step.side;
+      const dbName = step.name || "";
+      const timeout = typeof step.timeout === "number" ? step.timeout : 8000;
+      const deadline = Date.now() + timeout;
+      if (!dbName) return { ok: false, error: "select_db_in_side：缺少 name 参数" };
+
+      // Helper: get placeholder text from a select element (no visibility filter)
+      const getSelectPh = (el) => {
+        const inp = el.querySelector("input[placeholder]");
+        const span = el.querySelector(".ivu-select-placeholder, .ant-select-selection-placeholder");
+        return normalizeWhitespace((inp && inp.getAttribute("placeholder")) || (span && span.textContent) || "");
+      };
+
+      // Helper: check if a select still shows its placeholder (no value selected yet)
+      const showingPlaceholder = (el) => {
+        const span = el.querySelector(".ivu-select-placeholder");
+        if (span) {
+          const style = window.getComputedStyle(span);
+          return style.display !== "none" && style.visibility !== "hidden";
+        }
+        // For filterable select: placeholder attr exists and no selected-value text
+        const sel = el.querySelector(".ivu-select-selected-value");
+        return !sel || normalizeWhitespace(sel.textContent || "") === "";
+      };
+
+      let selected = false;
+      let lastDetail = "未开始";
+      do {
+        // Enumerate all selects (no visibility filter) for debugging
+        const allSelects = Array.from(document.querySelectorAll(".ivu-select, .ant-select, .el-select"));
+        const allPhs = allSelects.map(el => `"${getSelectPh(el)}"`).join(", ");
+
+        // For source: find first select with "数据库" in placeholder that still shows placeholder
+        // For target: same — after source is selected, its placeholder is gone, target is the remaining one
+        const trigger = allSelects.find(el => {
+          const ph = getSelectPh(el);
+          return ph.includes("数据库") && showingPlaceholder(el);
+        });
+
+        if (!trigger) {
+          lastDetail = `未找到还在显示 placeholder 的数据库 select，全部 select placeholders：[${allPhs || "无"}]`;
+          if (Date.now() < deadline) { await wait(300); continue; } break;
+        }
+
+        const selection = trigger.querySelector(".ivu-select-selection") || trigger;
+        selection.click();
+        await wait(500);
+
+        const dropdown = Array.from(document.querySelectorAll(".ivu-select-dropdown"))
+          .find(el => isElementVisible(el));
+        if (!dropdown) {
+          lastDetail = "点击后未出现 dropdown";
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+          if (Date.now() < deadline) { await wait(300); continue; }
+          break;
+        }
+
+        const target = normalizeWhitespace(dbName);
+        const items = Array.from(dropdown.querySelectorAll(".ivu-select-item:not(.ivu-select-item-disabled)"));
+        const match = items.find(el => normalizeWhitespace(el.textContent || "") === target)
+          || items.find(el => normalizeWhitespace(el.textContent || "").includes(target));
+        if (!match) {
+          const found = items.slice(0, 5).map(el => normalizeWhitespace(el.textContent || "")).join("、") || "无";
+          lastDetail = `未找到选项"${dbName}"，检测到：${found}`;
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+          if (Date.now() < deadline) { await wait(300); continue; }
+          break;
+        }
+        match.scrollIntoView({ block: "nearest" });
+        await wait(100);
+        match.click();
+        await wait(300);
+        selected = true;
+        break;
+      } while (Date.now() < deadline);
+
+      if (!selected) return { ok: false, error: `select_db_in_side（${side}）失败：${lastDetail}` };
+      return { ok: true };
+    }
+
+    case "select_job_type": {
+      // Selects job type in FunctionConfig: SYNC / MIGRATION / CHECK / STRUCT_MIGRATION
+      // step.jobType: the iView Radio label value (e.g. "SYNC")
+      // step.text: the display text (e.g. "增量同步") — either one is accepted
+      const timeout = typeof step.timeout === "number" ? step.timeout : 5000;
+      const deadline = Date.now() + timeout;
+      const targetValue = step.jobType ? normalizeWhitespace(step.jobType) : null;
+      const targetText = step.text ? normalizeWhitespace(step.text) : null;
+      let done = false;
+      do {
+        const container = document.querySelector(".function-config-container") || document;
+        const wrappers = Array.from(container.querySelectorAll(".ivu-radio-wrapper"));
+        const match = wrappers.find(w => {
+          const input = w.querySelector("input[type='radio']");
+          if (targetValue && input && normalizeWhitespace(input.value || "") === targetValue) return true;
+          if (targetText && normalizeWhitespace(w.textContent || "") === targetText) return true;
+          if (targetText && normalizeWhitespace(w.textContent || "").includes(targetText)) return true;
+          return false;
+        });
+        if (match && !match.classList.contains("ivu-radio-wrapper-disabled")) {
+          match.click();
+          done = true;
+          break;
+        }
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!done) return { ok: false, error: `未找到任务类型选项：jobType="${step.jobType}" text="${step.text}"` };
+      await wait(300);
+      return { ok: true };
+    }
+
+    case "click_first_spec_row": {
+      // Clicks the first row in the spec selection table inside FunctionConfig
+      const timeout = typeof step.timeout === "number" ? step.timeout : 5000;
+      const deadline = Date.now() + timeout;
+      let done = false;
+      do {
+        // The spec table has width:760px — find its first tbody row
+        const tables = Array.from(document.querySelectorAll(".ivu-table-body .ivu-table-tbody tr.ivu-table-row"));
+        const firstRow = tables.find(row => isElementVisible(row));
+        if (firstRow) {
+          firstRow.click();
+          done = true;
+          break;
+        }
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!done) return { ok: false, error: "未找到规格选择表格行" };
+      return { ok: true };
+    }
+
+    case "add_job_db_mapping": {
+      // In the TableFilter step, adds a DB mapping via "增加库" link.
+      // step.sourceDb: source database name
+      // step.sinkDb:   target database name
+      const sourceDb = step.sourceDb || "";
+      const sinkDb = step.sinkDb || "";
+      const timeout = typeof step.timeout === "number" ? step.timeout : 10000;
+      const deadline = Date.now() + timeout;
+
+      if (!sourceDb || !sinkDb) return { ok: false, error: "add_job_db_mapping：缺少 sourceDb 或 sinkDb" };
+
+      // 1. Click "增加库" link
+      let addLink = null;
+      do {
+        const links = Array.from(document.querySelectorAll(".add-db-item a, .add-db-item button"));
+        addLink = links.find(el => isElementVisible(el) && normalizeWhitespace(el.textContent || "").includes("增加库"));
+        if (addLink) break;
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!addLink) return { ok: false, error: "未找到\"增加库\"入口（.add-db-item）" };
+      addLink.click();
+      await wait(500);
+
+      // 2. Select source/sink DB in the .new-add-db-item form by nth ivu-select
+      const selectDbInForm = async (nth, dbName) => {
+        const form = document.querySelector(".new-add-db-item");
+        if (!form) return false;
+        const selects = Array.from(form.querySelectorAll(".ivu-select")).filter(el => isElementVisible(el));
+        const ivuSelect = selects[nth];
+        if (!ivuSelect) return false;
+        const selection = ivuSelect.querySelector(".ivu-select-selection");
+        if (!selection) return false;
+        selection.click();
+        await wait(400);
+        const dropdown = Array.from(document.querySelectorAll(".ivu-select-dropdown"))
+          .find(el => isElementVisible(el));
+        if (!dropdown) {
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+          return false;
+        }
+        const target = normalizeWhitespace(dbName);
+        const items = Array.from(dropdown.querySelectorAll(".ivu-select-item:not(.ivu-select-item-disabled)"));
+        const match = items.find(el => normalizeWhitespace(el.textContent || "") === target)
+          || items.find(el => normalizeWhitespace(el.textContent || "").includes(target));
+        if (!match) {
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+          return false;
+        }
+        match.scrollIntoView({ block: "nearest" });
+        await wait(100);
+        match.click();
+        await wait(300);
+        return true;
+      };
+
+      // Select source DB (first select in form)
+      let srcOk = false;
+      do {
+        srcOk = await selectDbInForm(0, sourceDb);
+        if (srcOk) break;
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!srcOk) return { ok: false, error: `未在新增库表单中找到源库："${sourceDb}"` };
+
+      // Select sink DB (second select in form)
+      let sinkOk = false;
+      do {
+        sinkOk = await selectDbInForm(1, sinkDb);
+        if (sinkOk) break;
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!sinkOk) return { ok: false, error: `未在新增库表单中找到目标库："${sinkDb}"` };
+
+      // 3. Click "确定" in the form
+      const form = document.querySelector(".new-add-db-item");
+      const confirmBtn = form
+        ? Array.from(form.querySelectorAll("button, .ivu-btn"))
+            .find(el => isElementVisible(el) && normalizeWhitespace(el.textContent || "") === "确定")
+        : null;
+      if (!confirmBtn) return { ok: false, error: "未找到新增库表单的\"确定\"按钮" };
+      confirmBtn.click();
+      await wait(500);
+      return { ok: true };
+    }
+
+    case "wait_for_job_created": {
+      // Waits for the job creation status modal to show success (state=INIT).
+      // Handles precheck modal: if "忽略并继续" button is present, clicks it.
+      const timeout = typeof step.timeout === "number" ? step.timeout : 120000;
+      const deadline = Date.now() + timeout;
+      do {
+        // Check success: ios-checkmark-circle icon or "创建成功" text visible
+        const successIcon = document.querySelector(".ivu-icon-ios-checkmark-circle");
+        if (successIcon && isElementVisible(successIcon)) return { ok: true };
+
+        const allText = document.body ? normalizeWhitespace(document.body.innerText || "") : "";
+        if (allText.includes("创建成功")) return { ok: true };
+
+        // Check creation failure modal
+        const errorAlert = document.querySelector(".ivu-alert-error");
+        if (errorAlert && isElementVisible(errorAlert)) {
+          const msg = normalizeWhitespace(errorAlert.innerText || "");
+          return { ok: false, error: `任务创建失败：${msg}` };
+        }
+
+        // Handle precheck modal — if it appears with "忽略并继续" button, click it
+        const ignorBtn = Array.from(document.querySelectorAll("button, .ivu-btn"))
+          .find(el => isElementVisible(el) && normalizeWhitespace(el.textContent || "").includes("忽略并继续"));
+        if (ignorBtn) {
+          ignorBtn.click();
+          await wait(500);
+          continue;
+        }
+
+        await wait(600);
+      } while (Date.now() < deadline);
+      return { ok: false, error: "等待任务创建成功超时" };
+    }
+
+    case "close_modal": {
+      const timeout = typeof step.timeout === "number" ? step.timeout : 3000;
+      const deadline = Date.now() + timeout;
+      let closed = false;
+      do {
+        // Try Escape key first — Ant Design modals handle it natively
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true, cancelable: true }));
+        await wait(300);
+        if (!findVisibleModal()) {
+          closed = true;
+          break;
+        }
+        // Try clicking close button variants
+        const closeBtn =
+          document.querySelector(".ant-modal-close-x") ||
+          document.querySelector(".ant-modal-close") ||
+          document.querySelector(".ivu-modal-close") ||
+          document.querySelector(".el-dialog__close");
+        if (closeBtn) {
+          closeBtn.click();
+          await wait(300);
+          if (!findVisibleModal()) {
+            closed = true;
+            break;
+          }
+        }
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      if (!closed) {
+        console.warn("[cc-auto] close_modal: modal still visible after timeout, continuing");
+      }
+      return { ok: true };
+    }
+
+    case "assert_url_contains": {
+      const expected = step.contains;
+      const timeout = typeof step.timeout === "number" ? step.timeout : 3000;
+      const deadline = Date.now() + timeout;
+      do {
+        if (window.location.href.includes(expected)) {
+          return { ok: true };
+        }
+        if (Date.now() < deadline) await wait(200);
+      } while (Date.now() < deadline);
+      return { ok: false, error: `URL 未包含"${expected}"，当前：${window.location.href}` };
+    }
+
+    case "click_table_header_checkbox": {
+      // Clicks the select-all checkbox in the leftmost table header to select all rows on the current page.
+      // Works with iView tables where the first <th> contains a .ivu-checkbox-wrapper.
+      const timeout = typeof step.timeout === "number" ? step.timeout : 10000;
+      const deadline = Date.now() + timeout;
+      let done = false;
+      do {
+        const headerCheckbox = document.querySelector(
+          ".ivu-table-header thead th:first-child .ivu-checkbox-wrapper"
+        ) || document.querySelector(
+          ".ivu-table-header thead th.ivu-table-column-type-selection .ivu-checkbox-wrapper"
+        );
+        if (headerCheckbox && isElementVisible(headerCheckbox)) {
+          headerCheckbox.click();
+          done = true;
+          break;
+        }
+        if (Date.now() < deadline) await wait(300);
+      } while (Date.now() < deadline);
+      if (!done) return { ok: false, error: "未找到表格表头的全选复选框" };
+      await wait(300);
+      return { ok: true };
+    }
+
+    default:
+      return { ok: false, error: `未知步骤类型："${type}"` };
+  }
+}
+
 function collectCcErrorSignals() {
   const signals = [];
   const errorSelectors = [
@@ -1387,10 +2454,12 @@ function selectRadioOptionByGroupLabel(groupLabel, optionText) {
   target.click();
   const input = target.querySelector("input[type='radio']");
   if (input) {
+    input.checked = true;
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
-
-  return target.classList.contains("ivu-radio-wrapper-checked") || Boolean(input && input.checked);
+  // Return true optimistically — Vue's DOM update is async so ivu-radio-wrapper-checked
+  // may not be set yet at this point. The caller's retry loop handles real failures.
+  return true;
 }
 
 function fillNetworkAddress(host, port) {

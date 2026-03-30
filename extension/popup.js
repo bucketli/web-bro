@@ -1,9 +1,16 @@
 const statusEl = document.getElementById("service-status");
+document.getElementById("open-test-plan").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("test-plan-viewer.html") });
+});
+document.getElementById("open-test-cases").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("test-cases-viewer.html") });
+});
 const featureSelectEl = document.getElementById("feature-select");
 const featureDescriptionEl = document.getElementById("feature-description");
 const featureInputSectionEl = document.getElementById("feature-input-section");
 const featureInputEl = document.getElementById("feature-input");
 const buttonEl = document.getElementById("action-button");
+const runAllButtonEl = document.getElementById("run-all-button");
 const bestItemSectionEl = document.getElementById("best-item-section");
 const bestItemCardEl = document.getElementById("best-item-card");
 const ccCasesSectionEl = document.getElementById("cc-cases-section");
@@ -105,36 +112,18 @@ const FEATURES = [
 let selectedFeatureId = "cc-automation-test";
 let taskPollTimer = null;
 let ccTaskPollTimer = null;
-const DEFAULT_CC_TEST_CASES = [
-  {
-    id: "job-list-page-check",
-    name: "任务列表",
-    passCriteria: "刷新 /#/data/job/list 页面后无报错",
-    status: "not-started",
-    detail: "目标页面：/#/data/job/list"
-  },
-  {
-    id: "datasource-add-entry-check",
-    name: "添加 MySQL 数据源",
-    passCriteria: "进入 /#/ccdatasource/add 后完成“自建+MySQL+关键字段填写”，并触发“新增数据源”提交",
-    status: "not-started",
-    detail: "目标页面：/#/ccdatasource/add"
-  },
-  {
-    id: "mysql-connection-check",
-    name: "测试 MySQL 链接",
-    passCriteria: "使用 mySqlDataSourceId_1 定位并执行测试连接，返回结果无错误信息",
-    status: "not-started",
-    detail: "目标页面：/#/ccdatasource（测试连接弹窗）"
-  }
-];
-let ccTestCases = cloneDefaultCcCases();
+// Loaded from cc-test-cases.json; each item: { id, name, passCriteria, status, detail }
+let ccTestCases = [];
 
 document.addEventListener("DOMContentLoaded", () => {
   renderFeatureList();
   syncFeatureView();
   refreshHealth();
   refreshTaobaoTask();
+  loadTestCasesFromConfig().then((cases) => {
+    ccTestCases = cases;
+    renderCcCases(ccTestCases);
+  });
   refreshCcAutomationTask();
   taskPollTimer = window.setInterval(refreshTaobaoTask, 1500);
   ccTaskPollTimer = window.setInterval(refreshCcAutomationTask, 1500);
@@ -153,7 +142,8 @@ ccClearButtonEl.addEventListener("click", async () => {
   try {
     ccClearButtonEl.disabled = true;
     await sendRuntimeMessage({ type: "CLEAR_CC_AUTOMATION_TASK" });
-    ccTestCases = cloneDefaultCcCases();
+    const freshCases = await loadTestCasesFromConfig();
+    ccTestCases = freshCases;
     renderCcCases(ccTestCases);
     renderSummary([
       `用例总数：${ccTestCases.length}`,
@@ -165,6 +155,49 @@ ccClearButtonEl.addEventListener("click", async () => {
     setMessage(error.message || "清理测试状态失败");
   } finally {
     ccClearButtonEl.disabled = false;
+  }
+});
+
+runAllButtonEl.addEventListener("click", async () => {
+  const siteUrl = featureInputEl.value.trim() || DEFAULT_CC_SITE_URL;
+  setMessage("CC 自动化测试任务已启动");
+  runAllButtonEl.disabled = true;
+  try {
+    await sendRuntimeMessage({ type: "RUN_CC_AUTOMATION_TEST", siteUrl });
+    await refreshCcAutomationTask();
+  } catch (error) {
+    setMessage(error.message || "启动失败");
+    runAllButtonEl.disabled = false;
+  }
+});
+
+ccCasesListEl.addEventListener("click", async (event) => {
+  const btn = event.target.closest(".cc-case-run-btn");
+  if (!btn || btn.disabled) {
+    return;
+  }
+  const caseId = btn.dataset.caseId;
+  if (!caseId) {
+    return;
+  }
+  const siteUrl = featureInputEl.value.trim() || DEFAULT_CC_SITE_URL;
+  btn.disabled = true;
+  runAllButtonEl.disabled = true;
+  ccTestCases = ccTestCases.map((c) =>
+    c.id === caseId ? { ...c, status: "running" } : c
+  );
+  renderCcCases(ccTestCases);
+  setMessage(`正在启动：${btn.dataset.caseName || caseId}`);
+  try {
+    await sendRuntimeMessage({ type: "RUN_CC_SINGLE_CASE", caseId, siteUrl });
+    await refreshCcAutomationTask();
+  } catch (error) {
+    setMessage(error.message || "启动失败");
+    ccTestCases = ccTestCases.map((c) =>
+      c.id === caseId ? { ...c, status: "failed", detail: error.message || "启动失败" } : c
+    );
+    renderCcCases(ccTestCases);
+    runAllButtonEl.disabled = false;
   }
 });
 
@@ -182,25 +215,12 @@ buttonEl.addEventListener("click", async () => {
   buttonEl.disabled = true;
 
   try {
-    const message = {
-      type: feature.messageType,
-      keyword
-    };
-    if (feature.id === "cc-automation-test") {
-      message.siteUrl = keyword;
-    }
-
+    const message = { type: feature.messageType, keyword };
     const response = await sendRuntimeMessage(message);
 
     if (feature.id === "taobao-guide") {
       setMessage("淘宝导购任务已启动，可关闭 popup 后稍后再看结果");
       await refreshTaobaoTask();
-      return;
-    }
-
-    if (feature.id === "cc-automation-test") {
-      setMessage("CC 自动化测试任务已启动");
-      await refreshCcAutomationTask();
       return;
     }
 
@@ -315,6 +335,7 @@ function clearResults() {
   renderFunctions([]);
   renderCcCases(ccTestCases);
   setMessage("");
+  runAllButtonEl.disabled = false;
 }
 
 function setMessage(text) {
@@ -330,7 +351,6 @@ function syncFeatureView() {
   const isCcAutomation = feature.id === "cc-automation-test";
   featureSelectEl.value = feature.id;
   featureDescriptionEl.textContent = feature.description || "";
-  buttonEl.textContent = feature.actionLabel;
   summaryTitleEl.textContent = feature.summaryTitle;
   functionsTitleEl.textContent = feature.functionsTitle;
   featureInputSectionEl.classList.toggle("hidden", !feature.requiresInput);
@@ -338,17 +358,23 @@ function syncFeatureView() {
   if (feature.requiresInput && feature.defaultInputValue && !featureInputEl.value.trim()) {
     featureInputEl.value = feature.defaultInputValue;
   }
-  buttonEl.classList.remove("hidden");
   summarySectionEl.classList.toggle("hidden", false);
   functionsSectionEl.classList.toggle("hidden", isCcAutomation);
   ccCasesSectionEl.classList.toggle("hidden", !isCcAutomation);
   ccClearButtonEl.classList.toggle("hidden", !isCcAutomation);
 
+  // CC automation uses dedicated run-all button; other features use the action button
+  buttonEl.classList.toggle("hidden", isCcAutomation);
+  runAllButtonEl.classList.toggle("hidden", !isCcAutomation);
+
   if (isCcAutomation) {
+    buttonEl.textContent = feature.actionLabel;
     renderBestItem(null);
     renderCcCases(ccTestCases);
     renderSummary(feature.emptySummary || []);
-    buttonEl.disabled = false;
+    runAllButtonEl.disabled = false;
+  } else {
+    buttonEl.textContent = feature.actionLabel;
   }
 
   if (feature.id !== "taobao-guide") {
@@ -367,12 +393,16 @@ function renderCcCases(cases) {
     return;
   }
 
+  const isSuiteRunning = runAllButtonEl.disabled;
+
   ccCasesListEl.innerHTML = cases.map((item) => {
     const name = escapeHtml(item.name || item.title || "未命名用例");
-    const passCriteria = escapeHtml(item.passCriteria || item.detail || "");
+    const passCriteria = escapeHtml(item.passCriteria || "");
     const detail = escapeHtml(item.detail || "");
     const status = normalizeCcStatus(item.status);
     const statusText = getCcStatusText(status);
+    const isRunning = status === "running";
+    const runBtnDisabled = isSuiteRunning || isRunning ? " disabled" : "";
     return `
       <li class="cc-case-item">
         <div class="cc-case-main">
@@ -380,34 +410,50 @@ function renderCcCases(cases) {
           <span class="cc-case-criteria">通过标准：${passCriteria || "未设置"}</span>
           ${detail ? `<span class="cc-case-criteria">执行结果：${detail}</span>` : ""}
         </div>
-        <span class="cc-case-status ${status}">${statusText}</span>
+        <div class="cc-case-actions">
+          <button class="cc-case-run-btn" data-case-id="${escapeHtml(item.id || "")}" data-case-name="${name}"${runBtnDisabled}>▶</button>
+          <span class="cc-case-status ${status}">${statusText}</span>
+        </div>
       </li>
     `;
   }).join("");
 }
 
 function normalizeCcStatus(status) {
-  if (status === "passed") {
-    return "passed";
-  }
-  if (status === "failed") {
-    return "failed";
-  }
+  if (status === "passed") { return "passed"; }
+  if (status === "failed") { return "failed"; }
+  if (status === "running") { return "running"; }
+  if (status === "skipped") { return "skipped"; }
   return "not-started";
 }
 
 function getCcStatusText(status) {
-  if (status === "passed") {
-    return "通过";
-  }
-  if (status === "failed") {
-    return "未通过";
-  }
+  if (status === "passed") { return "通过"; }
+  if (status === "failed") { return "未通过"; }
+  if (status === "running") { return "执行中"; }
+  if (status === "skipped") { return "已跳过"; }
   return "未开始";
 }
 
-function cloneDefaultCcCases() {
-  return DEFAULT_CC_TEST_CASES.map((item) => ({ ...item }));
+async function loadTestCasesFromConfig() {
+  try {
+    const url = chrome.runtime.getURL("cc-test-cases.json");
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+      return [];
+    }
+    const data = await response.json();
+    const cases = data && Array.isArray(data.cases) ? data.cases : [];
+    return cases.map((c) => ({
+      id: c.id || "",
+      name: c.name || "未命名用例",
+      passCriteria: c.passCriteria || "",
+      status: "not-started",
+      detail: ""
+    }));
+  } catch (error) {
+    return [];
+  }
 }
 
 async function refreshTaobaoTask() {
@@ -461,35 +507,65 @@ async function refreshCcAutomationTask() {
     }
 
     if (task.status === "running") {
-      buttonEl.disabled = true;
+      runAllButtonEl.disabled = true;
       setMessage(task.message || "CC 自动化测试执行中...");
+      // Mark the currently running case
+      if (task.runningCaseId) {
+        ccTestCases = ccTestCases.map((c) =>
+          c.id === task.runningCaseId ? { ...c, status: "running" } : c
+        );
+      }
+      renderCcCases(ccTestCases);
       return;
     }
 
-    buttonEl.disabled = false;
+    runAllButtonEl.disabled = false;
 
     if (task.status === "completed" && task.result) {
-      const cases = Array.isArray(task.result.cases) ? task.result.cases : [];
-      ccTestCases = cases;
+      const completedCases = Array.isArray(task.result.cases) ? task.result.cases : [];
+
+      if (task.runningCaseId) {
+        // Single-case run: merge result into existing list
+        ccTestCases = ccTestCases.map((c) => {
+          const updated = completedCases.find((r) => r.id === c.id);
+          return updated ? { ...c, ...updated } : c;
+        });
+      } else {
+        // Full suite: merge all results, preserving cases not in result
+        ccTestCases = ccTestCases.map((c) => {
+          const updated = completedCases.find((r) => r.id === c.id);
+          return updated ? { ...c, ...updated } : c;
+        });
+      }
+
       renderCcCases(ccTestCases);
       const summaryLines = Array.isArray(task.result.summary) && task.result.summary.length
         ? task.result.summary
         : [
-        `用例总数：${ccTestCases.length}`,
-        `通过数：${ccTestCases.filter((item) => item.status === "passed").length}`,
-        `未通过数：${ccTestCases.filter((item) => item.status === "failed").length}`
-      ];
+          `用例总数：${ccTestCases.length}`,
+          `通过数：${ccTestCases.filter((item) => item.status === "passed").length}`,
+          `未通过数：${ccTestCases.filter((item) => item.status === "failed").length}`
+        ];
       renderSummary(summaryLines);
-      setMessage(task.message || "CC 自动化测试执行完成");
+      setMessage(task.message || "执行完成");
       return;
     }
 
     if (task.status === "failed") {
-      setMessage(task.error || task.message || "CC 自动化测试执行失败");
+      // Restore running case to failed if single-case run failed
+      if (task.runningCaseId) {
+        ccTestCases = ccTestCases.map((c) =>
+          c.id === task.runningCaseId && c.status === "running"
+            ? { ...c, status: "failed", detail: task.error || task.message || "执行失败" }
+            : c
+        );
+        renderCcCases(ccTestCases);
+      }
+      setMessage(task.error || task.message || "执行失败");
     }
   } catch (error) {
     if (getSelectedFeature().id === "cc-automation-test") {
-      buttonEl.disabled = false;
+      runAllButtonEl.disabled = false;
     }
   }
 }

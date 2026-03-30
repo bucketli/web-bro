@@ -11,6 +11,7 @@ const TASK_STORAGE_KEY = "taobaoGuideTask";
 const CC_TASK_STORAGE_KEY = "ccAutomationTask";
 const CC_CONTEXT_STORAGE_KEY = "ccAutomationContext";
 const CC_AUTOMATION_CONFIG_FILE = "cc-automation.config.json";
+const CC_TEST_CASES_FILE = "cc-test-cases.json";
 const DEFAULT_MYSQL_ADD_CONFIG = {
   deployTypeLabel: "自建",
   dbTypeLabel: "MySQL",
@@ -71,6 +72,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "RUN_CC_AUTOMATION_TEST") {
     startCcAutomationTestTask(message.siteUrl)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "RUN_CC_SINGLE_CASE") {
+    startCcSingleCaseTask(message.caseId, message.siteUrl)
       .then((data) => sendResponse({ ok: true, data }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -215,6 +223,18 @@ async function ensureContentScript(tabId) {
     target: { tabId },
     files: ["content.js"]
   });
+
+  // Verify the injected script is ready (retry up to 5 times with 200ms delay)
+  for (let i = 0; i < 5; i++) {
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "PING" });
+      return;
+    } catch (pingError) {
+      if (i < 4) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+  }
 }
 
 async function ensureCcPageHook(tabId) {
@@ -281,26 +301,34 @@ async function startTaobaoGuideTask(keyword) {
 
 async function startCcAutomationTestTask(siteUrl) {
   const siteOrigin = buildCcSiteOrigin(siteUrl);
-  const jobListUrl = buildCcPageUrl(siteOrigin, CC_JOB_LIST_PATH);
-  const dataSourceListUrl = buildCcPageUrl(siteOrigin, CC_DATASOURCE_LIST_PATH);
-  const dataSourceAddUrl = buildCcPageUrl(siteOrigin, CC_DATASOURCE_ADD_PATH);
   const taskId = `cc-test-${Date.now()}`;
   await setCcTaskState({
     id: taskId,
     status: "running",
-    message: "正在执行 CC 自动化测试...",
+    message: "正在加载测试用例...",
     siteUrl: siteUrl || "",
-    targetUrl: jobListUrl,
     startedAt: new Date().toISOString(),
     result: null,
     error: ""
   });
 
-  runCcAutomationTest(taskId, {
-    jobListUrl,
-    dataSourceListUrl,
-    dataSourceAddUrl
-  }).catch(async (error) => {
+  const testCasesConfig = await loadCcTestCases();
+  const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
+    ? testCasesConfig.cases
+    : [];
+
+  if (!cases.length) {
+    await setCcTaskState({
+      id: taskId,
+      status: "failed",
+      message: "未找到测试用例，请检查 cc-test-cases.json",
+      finishedAt: new Date().toISOString(),
+      error: "未找到测试用例"
+    });
+    return { taskId, status: "failed" };
+  }
+
+  runTestSuiteWithCases(taskId, cases, siteOrigin).catch(async (error) => {
     await setCcTaskState({
       id: taskId,
       status: "failed",
@@ -310,223 +338,149 @@ async function startCcAutomationTestTask(siteUrl) {
     });
   });
 
-  return {
-    taskId,
-    status: "running"
-  };
+  return { taskId, status: "running" };
 }
 
-async function runCcAutomationTest(taskId, targetUrl) {
-  const automationConfig = await loadCcAutomationConfig();
-  const mysqlAddConfig = {
-    ...DEFAULT_MYSQL_ADD_CONFIG,
-    ...(automationConfig && automationConfig.mysqlAdd ? automationConfig.mysqlAdd : {})
-  };
+async function startCcSingleCaseTask(caseId, siteUrl) {
+  const testCasesConfig = await loadCcTestCases();
+  const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
+    ? testCasesConfig.cases
+    : [];
+  const caseConfig = cases.find((c) => c.id === caseId);
+
+  if (!caseConfig) {
+    throw new Error(`未找到用例：${caseId}`);
+  }
+
+  const siteOrigin = buildCcSiteOrigin(siteUrl);
+  const taskId = `cc-test-${Date.now()}`;
 
   await setCcTaskState({
     id: taskId,
     status: "running",
-    message: "正在创建测试标签页..."
+    message: `正在执行：${caseConfig.name}...`,
+    siteUrl: siteUrl || "",
+    startedAt: new Date().toISOString(),
+    result: null,
+    error: "",
+    runningCaseId: caseId
   });
 
-  const workerTab = await chrome.tabs.create({
-    url: targetUrl.jobListUrl,
-    active: false
+  runTestSuiteWithCases(taskId, [caseConfig], siteOrigin).catch(async (error) => {
+    await setCcTaskState({
+      id: taskId,
+      status: "failed",
+      message: error.message || "用例执行失败",
+      finishedAt: new Date().toISOString(),
+      error: error.message || "用例执行失败"
+    });
   });
 
+  return { taskId, status: "running" };
+}
+
+async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin) {
+  const automationConfig = await loadCcAutomationConfig();
+  const ac = automationConfig || {};
+  const config = {
+    mysqlAdd: { ...DEFAULT_MYSQL_ADD_CONFIG, ...(ac.mysqlAdd || {}) },
+    postgresAdd: { ...(ac.postgresAdd || {}) },
+    aliyunMysqlAdd: { ...(ac.aliyunMysqlAdd || {}) },
+    clusterCreate: { ...(ac.clusterCreate || {}) },
+    mysqlToMysqlJob: { ...(ac.mysqlToMysqlJob || {}) }
+  };
+
+  const sortedCases = topologicalSort(casesToRun);
+  const savedContext = await getCcContextState();
+  const context = savedContext ? { ...savedContext } : {};
+
+  await setCcTaskState({ id: taskId, status: "running", message: "正在创建测试标签页..." });
+
+  const workerTab = await chrome.tabs.create({ url: "about:blank", active: false });
   if (!workerTab || !workerTab.id) {
-    throw new Error("创建 CC 测试标签页失败");
+    throw new Error("创建测试标签页失败");
   }
-
   const workerTabId = workerTab.id;
 
+  const caseResults = [];
+  const failedCaseIds = new Set();
+
   try {
-    await setCcTaskState({
-      id: taskId,
-      status: "running",
-      message: "正在刷新测试页面..."
-    });
-
     await waitForTabComplete(workerTabId);
-    await ensureContentScript(workerTabId);
-    await reloadTabAndWait(workerTabId);
-    await ensureContentScript(workerTabId);
 
-    await setCcTaskState({
-      id: taskId,
-      status: "running",
-      message: "正在检测页面异常信号..."
-    });
-
-    const checkResult = await chrome.tabs.sendMessage(workerTabId, {
-      type: "RUN_CC_AUTOMATION_CHECK",
-      expectedUrl: targetUrl.jobListUrl
-    });
-
-    if (!checkResult || checkResult.ok === false) {
-      throw new Error(
-        checkResult && checkResult.error
-          ? checkResult.error
-          : "CC 自动化测试检查失败"
-      );
-    }
-
-    const passed = Boolean(checkResult.data && checkResult.data.passed);
-    const detail = checkResult.data && checkResult.data.reason
-      ? checkResult.data.reason
-      : (passed ? "页面刷新后未检测到明显异常" : "页面刷新后检测到异常信号");
-
-    await setCcTaskState({
-      id: taskId,
-      status: "running",
-      message: "正在验证“新增数据源”入口跳转..."
-    });
-
-    await updateTabAndWait(workerTabId, targetUrl.dataSourceListUrl);
-    await ensureContentScript(workerTabId);
-    await ensureCcPageHook(workerTabId);
-
-    const addSourceResult = await chrome.tabs.sendMessage(workerTabId, {
-      type: "RUN_CC_DATASOURCE_ADD_CHECK",
-      expectedListUrl: targetUrl.dataSourceListUrl,
-      expectedAddUrl: targetUrl.dataSourceAddUrl,
-      mysqlAddConfig
-    });
-
-    if (!addSourceResult || addSourceResult.ok === false) {
-      throw new Error(
-        addSourceResult && addSourceResult.error
-          ? addSourceResult.error
-          : "新增数据源检查失败"
-      );
-    }
-
-    const addCasePassed = Boolean(addSourceResult.data && addSourceResult.data.passed);
-    const addCaseDetail = addSourceResult.data && addSourceResult.data.reason
-      ? addSourceResult.data.reason
-      : (addCasePassed ? "已跳转并识别到填充项" : "新增数据源入口检查未通过");
-    const fillFields = addSourceResult.data && Array.isArray(addSourceResult.data.fillFields)
-      ? addSourceResult.data.fillFields
-      : [];
-    const mysqlRequiredFields = addSourceResult.data && addSourceResult.data.mysqlRequiredFields
-      ? addSourceResult.data.mysqlRequiredFields
-      : { required: [], found: [], missing: [] };
-    const submitTriggered = Boolean(addSourceResult.data && addSourceResult.data.submitTriggered);
-    const mySqlDataSourceId_1 = addSourceResult.data && addSourceResult.data.mySqlDataSourceId_1
-      ? String(addSourceResult.data.mySqlDataSourceId_1)
-      : "";
-    const context = await getCcContextState();
-    const persistedMySqlDataSourceId_1 = context && context.mySqlDataSourceId_1
-      ? String(context.mySqlDataSourceId_1)
-      : "";
-    const effectiveMySqlDataSourceId_1 = mySqlDataSourceId_1 || persistedMySqlDataSourceId_1;
-    const fieldPreview = fillFields
-      .slice(0, 3)
-      .map((item) => item.label || item.placeholder || item.name || "未命名字段")
-      .join("、");
-    console.log("[cc-automation] mysql connection test id", {
-      taskId,
-      mySqlDataSourceId_1: effectiveMySqlDataSourceId_1 || ""
-    });
-
-    await setCcTaskState({
-      id: taskId,
-      status: "running",
-      message: "正在执行“测试 MySQL 链接”..."
-    });
-
-    await updateTabAndWait(workerTabId, targetUrl.dataSourceListUrl);
-    await ensureContentScript(workerTabId);
-
-    const mysqlConnectionResult = await chrome.tabs.sendMessage(workerTabId, {
-      type: "RUN_CC_MYSQL_CONNECTION_TEST",
-      expectedListUrl: targetUrl.dataSourceListUrl,
-      mySqlDataSourceId_1: effectiveMySqlDataSourceId_1
-    });
-
-    if (!mysqlConnectionResult || mysqlConnectionResult.ok === false) {
-      throw new Error(
-        mysqlConnectionResult && mysqlConnectionResult.error
-          ? mysqlConnectionResult.error
-          : "MySQL 连接测试检查失败"
-      );
-    }
-
-    const mysqlConnectionPassed = Boolean(mysqlConnectionResult.data && mysqlConnectionResult.data.passed);
-    const mysqlConnectionDetail = mysqlConnectionResult.data && mysqlConnectionResult.data.reason
-      ? mysqlConnectionResult.data.reason
-      : (mysqlConnectionPassed ? "测试连接通过" : "测试连接未通过");
-    const connectionCaseDataSourceId = mysqlConnectionResult.data && mysqlConnectionResult.data.mySqlDataSourceId_1
-      ? String(mysqlConnectionResult.data.mySqlDataSourceId_1)
-      : effectiveMySqlDataSourceId_1;
-
-    const cases = [
-      {
-        id: "job-list-page-check",
-        name: "任务列表",
-        passCriteria: "刷新 /#/data/job/list 页面后无报错",
-        status: passed ? "passed" : "failed",
-        detail
-      },
-      {
-        id: "datasource-add-entry-check",
-        name: "添加 MySQL 数据源",
-        passCriteria: "进入 /#/ccdatasource/add 后完成“自建+MySQL+关键字段填写”，并触发“新增数据源”提交",
-        status: addCasePassed ? "passed" : "failed",
-        detail: addCaseDetail
-      },
-      {
-        id: "mysql-connection-check",
-        name: "测试 MySQL 链接",
-        passCriteria: "使用 mySqlDataSourceId_1 定位数据源，触发两段“测试连接”（列表入口+弹窗按钮）且无错误信息",
-        status: mysqlConnectionPassed ? "passed" : "failed",
-        detail: mysqlConnectionDetail
+    for (const caseConfig of sortedCases) {
+      if (caseConfig.disabled) {
+        caseResults.push({
+          id: caseConfig.id,
+          name: caseConfig.name,
+          passCriteria: caseConfig.passCriteria || "",
+          status: "skipped",
+          detail: "用例已禁用（disabled: true）"
+        });
+        continue;
       }
-    ];
 
-    const result = {
-      cases,
-      summary: [
-        `用例总数：${cases.length}`,
-        `通过数：${cases.filter((item) => item.status === "passed").length}`,
-        `MySQL关键项：${Array.isArray(mysqlRequiredFields.found) ? mysqlRequiredFields.found.length : 0}/${Array.isArray(mysqlRequiredFields.required) ? mysqlRequiredFields.required.length : 0}`,
-        `提交动作：${submitTriggered ? "已触发" : "未触发"}`,
-        `mySqlDataSourceId_1：${connectionCaseDataSourceId || "未识别"}`,
-        addCasePassed
-          ? `填充项数量：${fillFields.length}${fieldPreview ? `（示例：${fieldPreview}）` : ""}`
-          : "填充项数量：0"
-      ],
-      dataSourceAdd: {
-        fromUrl: addSourceResult.data && addSourceResult.data.fromUrl ? addSourceResult.data.fromUrl : targetUrl.dataSourceListUrl,
-        toUrl: addSourceResult.data && addSourceResult.data.toUrl ? addSourceResult.data.toUrl : "",
-        fillFields,
-        mysqlRequiredFields,
-        stepResults: addSourceResult.data && Array.isArray(addSourceResult.data.stepResults)
-          ? addSourceResult.data.stepResults
-          : [],
-        submitTriggered,
-        mySqlDataSourceId_1
-      },
-      mysqlConnection: {
-        mySqlDataSourceId_1: connectionCaseDataSourceId,
-        errors: mysqlConnectionResult.data && Array.isArray(mysqlConnectionResult.data.errors)
-          ? mysqlConnectionResult.data.errors
-          : []
-      },
-      checkedAt: new Date().toISOString(),
-      pageUrl: checkResult.data && checkResult.data.url ? checkResult.data.url : targetUrl.jobListUrl
-    };
+      const failedDeps = (caseConfig.dependsOn || []).filter((id) => failedCaseIds.has(id));
+      if (failedDeps.length) {
+        caseResults.push({
+          id: caseConfig.id,
+          name: caseConfig.name,
+          passCriteria: caseConfig.passCriteria || "",
+          status: "skipped",
+          detail: `前置用例未通过：${failedDeps.join("、")}`
+        });
+        continue;
+      }
 
-    if (connectionCaseDataSourceId) {
-      await setCcContextState({
-        mySqlDataSourceId_1: connectionCaseDataSourceId,
-        updatedAt: new Date().toISOString()
+      await setCcTaskState({
+        id: taskId,
+        status: "running",
+        message: `正在执行：${caseConfig.name}...`,
+        runningCaseId: caseConfig.id
+      });
+
+      console.log("[cc-automation] running case", { taskId, caseId: caseConfig.id });
+
+      const caseResult = await runCaseSteps(
+        caseConfig, workerTabId, context, config, siteOrigin
+      );
+
+      if (caseResult.contextUpdates) {
+        Object.assign(context, caseResult.contextUpdates);
+        await setCcContextState({ ...context, updatedAt: new Date().toISOString() });
+      }
+
+      if (!caseResult.passed) {
+        failedCaseIds.add(caseConfig.id);
+      }
+
+      caseResults.push({
+        id: caseConfig.id,
+        name: caseConfig.name,
+        passCriteria: caseConfig.passCriteria || "",
+        status: caseResult.passed ? "passed" : "failed",
+        detail: caseResult.reason || ""
       });
     }
-    const failedCases = cases.filter((item) => item.status !== "passed");
-    const completeMessage = failedCases.length
-      ? `CC 自动化测试执行完成（未通过：${failedCases.map((item) => `${item.name}-${item.detail || "无详情"}`).join("；")}）`
-      : "CC 自动化测试执行完成";
+
+    const passedCount = caseResults.filter((c) => c.status === "passed").length;
+    const failedCount = caseResults.filter((c) => c.status === "failed").length;
+    const skippedCount = caseResults.filter((c) => c.status === "skipped").length;
+
+    const result = {
+      cases: caseResults,
+      summary: [
+        `用例总数：${caseResults.length}`,
+        `通过：${passedCount}　未通过：${failedCount}${skippedCount ? `　跳过：${skippedCount}` : ""}`,
+        `mySqlDataSourceId_1：${context.mySqlDataSourceId_1 || "未识别"}`
+      ],
+      checkedAt: new Date().toISOString()
+    };
+
+    const failedList = caseResults.filter((c) => c.status === "failed");
+    const completeMessage = failedList.length
+      ? `执行完成（未通过：${failedList.map((c) => c.name).join("、")}）`
+      : "执行完成，全部通过";
 
     await setCcTaskState({
       id: taskId,
@@ -534,7 +488,8 @@ async function runCcAutomationTest(taskId, targetUrl) {
       message: completeMessage,
       finishedAt: new Date().toISOString(),
       result,
-      error: ""
+      error: "",
+      runningCaseId: ""
     });
 
     return result;
@@ -548,6 +503,144 @@ async function runCcAutomationTest(taskId, targetUrl) {
         message: error && error.message ? error.message : String(error)
       });
     }
+  }
+}
+
+async function runCaseSteps(caseConfig, workerTabId, context, config, siteOrigin) {
+  const steps = Array.isArray(caseConfig.steps) ? caseConfig.steps : [];
+  const contextUpdates = {};
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = resolveStepVars(steps[i], context, config);
+    console.log("[cc-automation] step", { caseId: caseConfig.id, index: i, type: step.type });
+
+    try {
+      let result;
+
+      if (step.type === "navigate") {
+        const url = buildCcPageUrl(siteOrigin, step.path);
+        await updateTabAndWait(workerTabId, url);
+        await ensureContentScript(workerTabId);
+        result = { ok: true };
+      } else if (step.type === "reload") {
+        await reloadTabAndWait(workerTabId);
+        await ensureContentScript(workerTabId);
+        result = { ok: true };
+      } else if (step.type === "inject_page_hook") {
+        await ensureCcPageHook(workerTabId);
+        result = { ok: true };
+      } else {
+        try {
+          result = await chrome.tabs.sendMessage(workerTabId, {
+            type: "EXECUTE_STEP",
+            step,
+            context: { ...context, ...contextUpdates }
+          });
+        } catch (msgError) {
+          if (msgError && msgError.message && msgError.message.includes("Receiving end does not exist")) {
+            // Content script lost (page may have redirected after navigate). Re-inject and retry.
+            await ensureContentScript(workerTabId);
+            result = await chrome.tabs.sendMessage(workerTabId, {
+              type: "EXECUTE_STEP",
+              step,
+              context: { ...context, ...contextUpdates }
+            });
+          } else {
+            throw msgError;
+          }
+        }
+      }
+
+      if (!result || result.ok === false) {
+        const reason = (result && result.error) || `步骤失败：${step.type}`;
+        return { passed: false, reason, contextUpdates };
+      }
+
+      if (result.contextUpdates) {
+        Object.assign(contextUpdates, result.contextUpdates);
+        Object.assign(context, result.contextUpdates);
+      }
+    } catch (error) {
+      return {
+        passed: false,
+        reason: `步骤异常（${step.type}）：${error && error.message ? error.message : String(error)}`,
+        contextUpdates
+      };
+    }
+  }
+
+  return {
+    passed: true,
+    reason: `${steps.length} 个步骤全部完成`,
+    contextUpdates
+  };
+}
+
+function resolveStepVar(value, context, config) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return value.replace(/\$\{(config|context)\.([^}]+)\}/g, (match, scope, path) => {
+    const obj = scope === "config" ? config : context;
+    const parts = path.split(".");
+    let cur = obj;
+    for (const part of parts) {
+      if (cur == null) {
+        return match;
+      }
+      cur = cur[part];
+    }
+    return cur != null ? String(cur) : match;
+  });
+}
+
+function resolveStepVars(step, context, config) {
+  const resolved = {};
+  for (const key of Object.keys(step)) {
+    const value = step[key];
+    resolved[key] = typeof value === "string"
+      ? resolveStepVar(value, context, config)
+      : value;
+  }
+  return resolved;
+}
+
+function topologicalSort(cases) {
+  const map = new Map(cases.map((c) => [c.id, c]));
+  const visited = new Set();
+  const result = [];
+
+  function visit(c) {
+    if (visited.has(c.id)) {
+      return;
+    }
+    visited.add(c.id);
+    for (const depId of (c.dependsOn || [])) {
+      const dep = map.get(depId);
+      if (dep) {
+        visit(dep);
+      }
+    }
+    result.push(c);
+  }
+
+  cases.forEach((c) => visit(c));
+  return result;
+}
+
+async function loadCcTestCases() {
+  try {
+    const response = await fetch(chrome.runtime.getURL(CC_TEST_CASES_FILE), {
+      method: "GET",
+      cache: "no-store"
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const data = await response.json();
+    return data && typeof data === "object" ? data : null;
+  } catch (error) {
+    return null;
   }
 }
 
@@ -719,7 +812,7 @@ function waitForTabComplete(tabId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(handleUpdated);
-      reject(new Error("淘宝页面加载超时"));
+      reject(new Error("页面加载超时"));
     }, 20000);
 
     function handleUpdated(updatedTabId, changeInfo) {
@@ -756,7 +849,7 @@ function updateTabAndWait(tabId, url) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(handleUpdated);
-      reject(new Error("淘宝页面加载超时"));
+      reject(new Error("页面加载超时"));
     }, 20000);
 
     function cleanup() {
