@@ -34,6 +34,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "SCAN_YUQUE_TOC") {
+    scanYuqueToc(message.prefix || "")
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "EXTRACT_REQUIREMENTS_SECTION") {
+    extractRequirementsSection(message.heading || "需求")
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
   if (message.type === "RUN_TAOBAO_SEARCH") {
     runTaobaoSearch(message.keyword)
       .then((result) => sendResponse(result))
@@ -924,6 +938,77 @@ async function executeStep(step, context) {
       }
       btn.click();
       return { ok: true };
+    }
+
+    case "click_selector": {
+      const selector = String(step.selector || "").trim();
+      if (!selector) {
+        return { ok: false, error: "click_selector：缺少 selector 参数" };
+      }
+      const timeout = typeof step.timeout === "number" ? step.timeout : 0;
+      const deadline = Date.now() + timeout;
+      const index = Number.isInteger(step.index) && step.index >= 0 ? step.index : 0;
+      let target = null;
+      do {
+        const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => isElementVisible(node));
+        if (nodes.length > index) {
+          target = nodes[index];
+          break;
+        }
+        if (Date.now() < deadline) {
+          await wait(200);
+        }
+      } while (Date.now() < deadline);
+
+      if (!target) {
+        return {
+          ok: false,
+          error: `未找到可点击元素：selector="${selector}" index=${index}`
+        };
+      }
+
+      if (typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({ block: "center", inline: "nearest" });
+        await wait(80);
+      }
+      target.click();
+      return { ok: true };
+    }
+
+    case "select_worker_with_action": {
+      const action = String(step.action || "").trim();
+      const timeout = typeof step.timeout === "number" ? step.timeout : 10000;
+      const deadline = Date.now() + timeout;
+      const cardSelector = step.cardSelector || ".worker-item-content";
+
+      const isActionReady = () => {
+        if (action === "delete") {
+          return !!document.querySelector(".worker-item-selected .worker-action-item:not(.worker-action-item-disabled) .icondel");
+        }
+        if (action === "monitor") {
+          return !!document.querySelector(".worker-item-selected .to-monitor-icon");
+        }
+        return !!document.querySelector(".worker-item-selected");
+      };
+
+      do {
+        const cards = Array.from(document.querySelectorAll(cardSelector)).filter((node) => isElementVisible(node));
+        for (const card of cards) {
+          card.click();
+          await wait(150);
+          if (isActionReady()) {
+            return { ok: true };
+          }
+        }
+        if (Date.now() < deadline) {
+          await wait(250);
+        }
+      } while (Date.now() < deadline);
+
+      return {
+        ok: false,
+        error: `未找到可执行动作的机器卡片：action="${action || "any"}"`
+      };
     }
 
     case "fill_input": {
@@ -3252,6 +3337,123 @@ function normalizeTaobaoLink(link) {
   }
 
   return value;
+}
+
+async function scanYuqueToc(prefix) {
+  if (!isYuquePage()) {
+    throw new Error("当前页面不是语雀文档页");
+  }
+
+  const scrollContainer = document.querySelector(".lark-virtual-tree");
+  if (!scrollContainer) {
+    throw new Error("未找到目录虚拟列表，请确保左侧目录已展开");
+  }
+
+  const itemMap = new Map();
+
+  const collectVisible = () => {
+    const nodes = scrollContainer.querySelectorAll(".catalogTreeItem-module_CatalogItem_qUomU");
+    for (const node of nodes) {
+      const top = parseInt(node.style.top || "0", 10);
+      if (itemMap.has(top)) continue;
+
+      const contentEl = node.querySelector(".catalogTreeItem-module_content_Tae8T");
+      const titleEl = node.querySelector(".catalogTreeItem-module_title_NOuR5");
+      const titleWrapperEl = node.querySelector(".catalogTreeItem-module_titleWrapper_CfEC7");
+
+      if (!contentEl || !titleEl) continue;
+
+      const paddingLeft = parseInt(contentEl.style.paddingLeft || "0", 10);
+      const title = titleEl.textContent.trim();
+      const titleAttr = titleWrapperEl ? (titleWrapperEl.getAttribute("title") || "") : "";
+      const href = contentEl.tagName === "A" ? contentEl.getAttribute("href") : null;
+
+      itemMap.set(top, { top, paddingLeft, title, titleAttr, href });
+    }
+  };
+
+  scrollContainer.scrollTop = 0;
+  await wait(200);
+  collectVisible();
+
+  const viewHeight = scrollContainer.clientHeight;
+
+  while (scrollContainer.scrollTop + viewHeight < scrollContainer.scrollHeight - 4) {
+    scrollContainer.scrollTop += viewHeight;
+    await wait(150);
+    collectVisible();
+  }
+
+  const sorted = [...itemMap.values()].sort((a, b) => a.top - b.top);
+
+  let inTestRelated = false;
+  let inBranchTest = false;
+  const results = [];
+  const origin = window.location.origin;
+
+  for (const item of sorted) {
+    if (item.paddingLeft === 0) {
+      inTestRelated = item.titleAttr.includes("测试相关") || item.title === "测试相关";
+      inBranchTest = false;
+    } else if (item.paddingLeft === 24) {
+      if (inTestRelated) {
+        inBranchTest = item.titleAttr.includes("分支测试验证") || item.title === "分支测试验证";
+      } else {
+        inBranchTest = false;
+      }
+    } else if (item.paddingLeft === 48 && inBranchTest) {
+      if (item.href && item.title.startsWith(prefix)) {
+        results.push({ title: item.title, url: `${origin}${item.href}` });
+      }
+    } else if (item.paddingLeft > 0 && item.paddingLeft < 48 && inBranchTest) {
+      inBranchTest = false;
+    }
+  }
+
+  return { ok: true, items: results };
+}
+
+async function extractRequirementsSection(heading) {
+  let editorRoot = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) await wait(1500);
+
+    editorRoot =
+      document.querySelector("#doc-reader-content article#content .ne-viewer-body") ||
+      document.querySelector("#doc-reader-content .ne-viewer-body") ||
+      document.querySelector("#doc-reader-content");
+
+    if (editorRoot && editorRoot.children.length > 0) break;
+    editorRoot = null;
+  }
+
+  if (!editorRoot) {
+    return { ok: true, found: false, content: "" };
+  }
+
+  const children = Array.from(editorRoot.children);
+
+  const h2Index = children.findIndex((child) => {
+    const tag = child.tagName ? child.tagName.toLowerCase() : "";
+    return tag === "ne-h2" && child.textContent.trim() === heading;
+  });
+
+  if (h2Index === -1) {
+    return { ok: true, found: false, content: "" };
+  }
+
+  const sectionBlocks = [];
+  for (let i = h2Index + 1; i < children.length; i++) {
+    const child = children[i];
+    if (child.tagName && child.tagName.toLowerCase() === "ne-h2") break;
+    sectionBlocks.push(child);
+  }
+
+  const lines = sectionBlocks.map((block) => formatYuqueBlock(block)).filter(Boolean);
+  const content = lines.join("\n\n").trim();
+
+  return { ok: true, found: true, content };
 }
 
 function isYuquePage() {

@@ -5,6 +5,7 @@ document.getElementById("open-test-plan").addEventListener("click", () => {
 document.getElementById("open-test-cases").addEventListener("click", () => {
   chrome.tabs.create({ url: chrome.runtime.getURL("test-cases-viewer.html") });
 });
+const viewerLinksEl = document.querySelector(".viewer-links");
 const featureSelectEl = document.getElementById("feature-select");
 const featureDescriptionEl = document.getElementById("feature-description");
 const featureInputSectionEl = document.getElementById("feature-input-section");
@@ -21,6 +22,8 @@ const functionsTitleEl = document.getElementById("functions-title");
 const summaryListEl = document.getElementById("summary-list");
 const functionsListEl = document.getElementById("functions-list");
 const messageEl = document.getElementById("message");
+const yuqueCollectOptionsSectionEl = document.getElementById("yuque-collect-options-section");
+const yuqueExportUsersEl = document.getElementById("yuque-export-users");
 const summarySectionEl = summaryTitleEl.closest(".result-section");
 const functionsSectionEl = functionsTitleEl.closest(".result-section");
 const DEFAULT_CC_SITE_URL = "http://localhost:8080/";
@@ -65,29 +68,23 @@ const FEATURES = [
     ]
   },
   {
-    id: "yuque-optimize",
-    title: "羽雀文档优化",
-    description: "按目标优化当前羽雀文档，并自动写回后发布",
-    actionLabel: "执行羽雀文档优化",
-    loadingLabel: "正在分析并优化羽雀文档...",
-    successLabel: "羽雀文档已优化并触发更新",
-    messageType: "OPTIMIZE_YUQUE_DOC",
-    summaryTitle: "优化总结",
-    functionsTitle: "优化动作",
-    requiresBackend: true,
+    id: "yuque-collect",
+    title: "语雀需求汇总",
+    description: "扫描「分支测试验证」目录，提取文件名匹配前缀的文件中的「需求」小节，并下载汇总文件",
+    actionLabel: "开始汇总",
+    loadingLabel: "正在扫描目录...",
+    successLabel: "需求汇总完成",
+    messageType: "RUN_YUQUE_COLLECT",
+    summaryTitle: "汇总进度",
+    functionsTitle: "操作说明",
     requiresInput: true,
-    inputLabel: "优化目标",
-    inputPlaceholder: "例如：改得更专业、更清晰，并补全步骤说明",
-    emptyInputMessage: "请输入优化目标",
+    inputLabel: "文件名前缀",
+    inputPlaceholder: "例如：[v5.5.0.0]",
+    emptyInputMessage: "请输入文件名前缀",
     emptyFunctions: [
-      {
-        name: "读取文档内容",
-        detail: "扩展会抓取当前羽雀页面中的标题和正文内容"
-      },
-      {
-        name: "自动回填更新",
-        detail: "优化结果会自动写回编辑器，并点击更新按钮发布"
-      }
+      { name: "扫描目录", detail: "遍历左侧「分支测试验证」目录，找出文件名以指定前缀开头的文件" },
+      { name: "提取需求小节", detail: "逐一打开匹配文件，提取「需求」h2 标题下的全部内容" },
+      { name: "下载汇总文件", detail: "将所有内容整合成 Markdown 文件自动下载" }
     ]
   },
   {
@@ -109,9 +106,10 @@ const FEATURES = [
   }
 ];
 
-let selectedFeatureId = "cc-automation-test";
+let selectedFeatureId = "yuque-collect";
 let taskPollTimer = null;
 let ccTaskPollTimer = null;
+let yuqueCollectPollTimer = null;
 // Loaded from cc-test-cases.json; each item: { id, name, passCriteria, status, detail }
 let ccTestCases = [];
 
@@ -125,8 +123,10 @@ document.addEventListener("DOMContentLoaded", () => {
     renderCcCases(ccTestCases);
   });
   refreshCcAutomationTask();
+  refreshYuqueCollectTask();
   taskPollTimer = window.setInterval(refreshTaobaoTask, 1500);
   ccTaskPollTimer = window.setInterval(refreshCcAutomationTask, 1500);
+  yuqueCollectPollTimer = window.setInterval(refreshYuqueCollectTask, 1500);
 });
 
 window.addEventListener("beforeunload", () => {
@@ -135,6 +135,9 @@ window.addEventListener("beforeunload", () => {
   }
   if (ccTaskPollTimer) {
     window.clearInterval(ccTaskPollTimer);
+  }
+  if (yuqueCollectPollTimer) {
+    window.clearInterval(yuqueCollectPollTimer);
   }
 });
 
@@ -216,11 +219,20 @@ buttonEl.addEventListener("click", async () => {
 
   try {
     const message = { type: feature.messageType, keyword };
+    if (feature.id === "yuque-collect") {
+      message.exportUserRequirements = yuqueExportUsersEl.checked;
+    }
     const response = await sendRuntimeMessage(message);
 
     if (feature.id === "taobao-guide") {
       setMessage("淘宝导购任务已启动，可关闭 popup 后稍后再看结果");
       await refreshTaobaoTask();
+      return;
+    }
+
+    if (feature.id === "yuque-collect") {
+      setMessage("需求汇总任务已启动，请稍候...");
+      await refreshYuqueCollectTask();
       return;
     }
 
@@ -362,6 +374,8 @@ function syncFeatureView() {
   functionsSectionEl.classList.toggle("hidden", isCcAutomation);
   ccCasesSectionEl.classList.toggle("hidden", !isCcAutomation);
   ccClearButtonEl.classList.toggle("hidden", !isCcAutomation);
+  viewerLinksEl.classList.toggle("hidden", !isCcAutomation);
+  yuqueCollectOptionsSectionEl.classList.toggle("hidden", feature.id !== "yuque-collect");
 
   // CC automation uses dedicated run-all button; other features use the action button
   buttonEl.classList.toggle("hidden", isCcAutomation);
@@ -375,6 +389,10 @@ function syncFeatureView() {
     runAllButtonEl.disabled = false;
   } else {
     buttonEl.textContent = feature.actionLabel;
+    if (feature.id === "yuque-collect") {
+      renderSummary(["请在语雀知识库页面触发", "确保左侧「分支测试验证」目录已展开", "输入文件名前缀后点击开始汇总"]);
+      renderFunctions(feature.emptyFunctions || []);
+    }
   }
 
   if (feature.id !== "taobao-guide") {
@@ -566,6 +584,51 @@ async function refreshCcAutomationTask() {
   } catch (error) {
     if (getSelectedFeature().id === "cc-automation-test") {
       runAllButtonEl.disabled = false;
+    }
+  }
+}
+
+async function refreshYuqueCollectTask() {
+  try {
+    const response = await sendRuntimeMessage({ type: "GET_YUQUE_COLLECT_TASK" });
+    const task = response.data;
+    if (!task || getSelectedFeature().id !== "yuque-collect") return;
+
+    if (task.status === "running") {
+      buttonEl.disabled = true;
+      setMessage(task.message || "正在执行...");
+      if (typeof task.total === "number" && task.total > 0) {
+        renderSummary([
+          `匹配文件：${task.total} 个`,
+          `已处理：${task.processed || 0} / ${task.total}`,
+          `已收集需求：${task.collected || 0} 个`
+        ]);
+      }
+      return;
+    }
+
+    buttonEl.disabled = false;
+
+    if (task.status === "completed" && task.result) {
+      const skippedLine = task.result.skipped
+        ? `未找到需求小节（${task.result.skipped}个）：${(task.result.skippedTitles || []).join("、")}`
+        : "全部文件均含需求小节";
+      renderSummary([
+        `扫描文件：${task.result.total} 个`,
+        `成功提取需求：${task.result.collected} 个`,
+        skippedLine
+      ]);
+      renderFunctions(getSelectedFeature().emptyFunctions || []);
+      setMessage(task.message || "汇总完成，文件已下载");
+      return;
+    }
+
+    if (task.status === "failed") {
+      setMessage(task.error || task.message || "汇总失败");
+    }
+  } catch (error) {
+    if (getSelectedFeature().id === "yuque-collect") {
+      buttonEl.disabled = false;
     }
   }
 }
