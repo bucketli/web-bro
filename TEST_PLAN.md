@@ -113,16 +113,16 @@
 |------|---------|---------|------|
 | ✅ | `cluster-list-check` | 集群列表页面检查 | 导航到 `/#/ccsystem/resource` 后无报错 |
 | ✅ | `cluster-create` | 创建集群 | 点击「新增集群」，填写集群描述并保存，验证创建成功 |
-| 🔲 | `cluster-detail-check` | 集群详情（机器列表）页面检查 | 点击集群进入机器列表页，页面无报错 |
+| ✅ | `cluster-detail-check` | 集群详情（机器列表）页面检查 | 点击集群进入机器列表页，页面无报错 |
 | ✅ | `cluster-delete` | 删除集群 | 找到测试集群行点击删除，确认后无报错 | `cluster-create` |
 
 ### 3.2 机器管理
 
 | 状态 | 用例 ID | 用例名称 | 说明 | 依赖 |
 |------|---------|---------|------|------|
-| 🔲 | `worker-add` | 添加机器 | 在集群详情页点击「新增机器」，填写 IP 并保存 | `cluster-create` |
-| 🔲 | `worker-monitor-check` | 机器监控页面检查 | 点击机器的「监控」，监控图表页面无报错 | `cluster-detail-check` |
-| 🔲 | `worker-delete` | 删除机器 | 删除刚添加的机器，确认后无报错 | `worker-add` |
+| ✅ | `worker-add` | 添加机器 | 在集群详情页点击「新增机器」，执行机器创建动作并无报错 | `cluster-detail-check` |
+| ✅ | `worker-monitor-check` | 机器监控页面检查 | 点击机器的「监控」，监控图表页面无报错 | `worker-add` |
+| ✅ | `worker-delete` | 删除机器 | 删除刚添加的机器，确认后无报错 | `worker-add` |
 
 ---
 
@@ -174,8 +174,8 @@
 
 | | 数量 |
 |-|------|
-| **已实现** ✅ | 24 |
-| **待实现** 🔲 | 36 |
+| **已实现** ✅ | 28 |
+| **待实现** 🔲 | 32 |
 | **暂不实现** ⏭️ | 2 |
 | **合计** | 62 |
 
@@ -197,7 +197,6 @@
 
 - `job-detail-exception-log` / `job-detail-view-metadata` / `job-detail-restart-history` — 任务详情操作覆盖
 - `job-detail-params-edit` — 参数编辑页面检查
-- `cluster-detail-check` / `worker-add` / `worker-delete` — 机器管理闭环
 - `job-group-create` / `job-group-delete` — 任务组增删闭环
 - `alert-setting-check` — 告警配置
 - `datasource-add-oracle` / `datasource-add-sqlserver` — 常用 DB 类型

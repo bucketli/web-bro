@@ -10,8 +10,10 @@ const DEFAULT_CC_SITE_URL = "http://localhost:8080/";
 const TASK_STORAGE_KEY = "taobaoGuideTask";
 const CC_TASK_STORAGE_KEY = "ccAutomationTask";
 const CC_CONTEXT_STORAGE_KEY = "ccAutomationContext";
+const YUQUE_COLLECT_TASK_STORAGE_KEY = "yuqueCollectTask";
 const CC_AUTOMATION_CONFIG_FILE = "cc-automation.config.json";
 const CC_TEST_CASES_FILE = "cc-test-cases.json";
+let ccStartInFlight = false;
 const DEFAULT_MYSQL_ADD_CONFIG = {
   deployTypeLabel: "自建",
   dbTypeLabel: "MySQL",
@@ -60,6 +62,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => {
         sendResponse({ ok: false, error: error.message });
       });
+    return true;
+  }
+
+  if (message.type === "RUN_YUQUE_COLLECT") {
+    startYuqueCollectTask(message.keyword, Boolean(message.exportUserRequirements))
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "GET_YUQUE_COLLECT_TASK") {
+    getYuqueCollectTaskState()
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "CLEAR_YUQUE_COLLECT_TASK") {
+    clearYuqueCollectTaskState()
+      .then(() => sendResponse({ ok: true, data: { cleared: true } }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
 
@@ -300,86 +323,94 @@ async function startTaobaoGuideTask(keyword) {
 }
 
 async function startCcAutomationTestTask(siteUrl) {
-  const siteOrigin = buildCcSiteOrigin(siteUrl);
-  const taskId = `cc-test-${Date.now()}`;
-  await setCcTaskState({
-    id: taskId,
-    status: "running",
-    message: "正在加载测试用例...",
-    siteUrl: siteUrl || "",
-    startedAt: new Date().toISOString(),
-    result: null,
-    error: ""
-  });
+  return runWithCcStartLock(async () => {
+    await assertCcTaskIdle();
 
-  const testCasesConfig = await loadCcTestCases();
-  const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
-    ? testCasesConfig.cases
-    : [];
-
-  if (!cases.length) {
+    const siteOrigin = buildCcSiteOrigin(siteUrl);
+    const taskId = `cc-test-${Date.now()}`;
     await setCcTaskState({
       id: taskId,
-      status: "failed",
-      message: "未找到测试用例，请检查 cc-test-cases.json",
-      finishedAt: new Date().toISOString(),
-      error: "未找到测试用例"
+      status: "running",
+      message: "正在加载测试用例...",
+      siteUrl: siteUrl || "",
+      startedAt: new Date().toISOString(),
+      result: null,
+      error: ""
     });
-    return { taskId, status: "failed" };
-  }
 
-  runTestSuiteWithCases(taskId, cases, siteOrigin).catch(async (error) => {
-    await setCcTaskState({
-      id: taskId,
-      status: "failed",
-      message: error.message || "CC 自动化测试执行失败",
-      finishedAt: new Date().toISOString(),
-      error: error.message || "CC 自动化测试执行失败"
+    const testCasesConfig = await loadCcTestCases();
+    const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
+      ? testCasesConfig.cases
+      : [];
+
+    if (!cases.length) {
+      await setCcTaskState({
+        id: taskId,
+        status: "failed",
+        message: "未找到测试用例，请检查 cc-test-cases.json",
+        finishedAt: new Date().toISOString(),
+        error: "未找到测试用例"
+      });
+      return { taskId, status: "failed" };
+    }
+
+    runTestSuiteWithCases(taskId, cases, siteOrigin, { resetContext: true }).catch(async (error) => {
+      await setCcTaskState({
+        id: taskId,
+        status: "failed",
+        message: error.message || "CC 自动化测试执行失败",
+        finishedAt: new Date().toISOString(),
+        error: error.message || "CC 自动化测试执行失败"
+      });
     });
+
+    return { taskId, status: "running" };
   });
-
-  return { taskId, status: "running" };
 }
 
 async function startCcSingleCaseTask(caseId, siteUrl) {
-  const testCasesConfig = await loadCcTestCases();
-  const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
-    ? testCasesConfig.cases
-    : [];
-  const caseConfig = cases.find((c) => c.id === caseId);
+  return runWithCcStartLock(async () => {
+    await assertCcTaskIdle();
 
-  if (!caseConfig) {
-    throw new Error(`未找到用例：${caseId}`);
-  }
+    const testCasesConfig = await loadCcTestCases();
+    const cases = testCasesConfig && Array.isArray(testCasesConfig.cases)
+      ? testCasesConfig.cases
+      : [];
+    const caseConfig = cases.find((c) => c.id === caseId);
 
-  const siteOrigin = buildCcSiteOrigin(siteUrl);
-  const taskId = `cc-test-${Date.now()}`;
+    if (!caseConfig) {
+      throw new Error(`未找到用例：${caseId}`);
+    }
 
-  await setCcTaskState({
-    id: taskId,
-    status: "running",
-    message: `正在执行：${caseConfig.name}...`,
-    siteUrl: siteUrl || "",
-    startedAt: new Date().toISOString(),
-    result: null,
-    error: "",
-    runningCaseId: caseId
-  });
+    const siteOrigin = buildCcSiteOrigin(siteUrl);
+    const taskId = `cc-test-${Date.now()}`;
 
-  runTestSuiteWithCases(taskId, [caseConfig], siteOrigin).catch(async (error) => {
     await setCcTaskState({
       id: taskId,
-      status: "failed",
-      message: error.message || "用例执行失败",
-      finishedAt: new Date().toISOString(),
-      error: error.message || "用例执行失败"
+      status: "running",
+      message: `正在执行：${caseConfig.name}...`,
+      siteUrl: siteUrl || "",
+      startedAt: new Date().toISOString(),
+      result: null,
+      error: "",
+      runningCaseId: caseId
     });
-  });
 
-  return { taskId, status: "running" };
+    runTestSuiteWithCases(taskId, [caseConfig], siteOrigin, { resetContext: false }).catch(async (error) => {
+      await setCcTaskState({
+        id: taskId,
+        status: "failed",
+        message: error.message || "用例执行失败",
+        finishedAt: new Date().toISOString(),
+        error: error.message || "用例执行失败"
+      });
+    });
+
+    return { taskId, status: "running" };
+  });
 }
 
-async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin) {
+async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin, options) {
   const automationConfig = await loadCcAutomationConfig();
   const ac = automationConfig || {};
   const config = {
@@ -390,9 +421,17 @@ async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin) {
     mysqlToMysqlJob: { ...(ac.mysqlToMysqlJob || {}) }
   };
 
+  const runOptions = options || {};
+  const resetContext = runOptions.resetContext !== false;
   const sortedCases = topologicalSort(casesToRun);
-  const savedContext = await getCcContextState();
-  const context = savedContext ? { ...savedContext } : {};
+  const savedContext = resetContext ? null : await getCcContextState();
+  const context = buildCcRuntimeContext(savedContext, siteOrigin);
+  if (resetContext) {
+    await setCcContextState({
+      _siteOrigin: siteOrigin,
+      updatedAt: new Date().toISOString()
+    });
+  }
 
   await setCcTaskState({ id: taskId, status: "running", message: "正在创建测试标签页..." });
 
@@ -432,6 +471,19 @@ async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin) {
         continue;
       }
 
+      const missingContext = getMissingRequiredContext(caseConfig.requiredContext, context);
+      if (missingContext.length) {
+        failedCaseIds.add(caseConfig.id);
+        caseResults.push({
+          id: caseConfig.id,
+          name: caseConfig.name,
+          passCriteria: caseConfig.passCriteria || "",
+          status: "failed",
+          detail: `缺少必需上下文：${missingContext.join("、")}`
+        });
+        continue;
+      }
+
       await setCcTaskState({
         id: taskId,
         status: "running",
@@ -447,7 +499,11 @@ async function runTestSuiteWithCases(taskId, casesToRun, siteOrigin) {
 
       if (caseResult.contextUpdates) {
         Object.assign(context, caseResult.contextUpdates);
-        await setCcContextState({ ...context, updatedAt: new Date().toISOString() });
+        await setCcContextState({
+          ...context,
+          _siteOrigin: siteOrigin,
+          updatedAt: new Date().toISOString()
+        });
       }
 
       if (!caseResult.passed) {
@@ -512,6 +568,14 @@ async function runCaseSteps(caseConfig, workerTabId, context, config, siteOrigin
 
   for (let i = 0; i < steps.length; i++) {
     const step = resolveStepVars(steps[i], context, config);
+    const unresolvedVars = findStepTemplateVars(step);
+    if (unresolvedVars.length && step.type !== "comment") {
+      return {
+        passed: false,
+        reason: `步骤变量未解析：${unresolvedVars.join("、")}`,
+        contextUpdates
+      };
+    }
     console.log("[cc-automation] step", { caseId: caseConfig.id, index: i, type: step.type });
 
     try {
@@ -975,7 +1039,272 @@ async function setCcTaskState(task) {
 }
 
 async function clearCcTaskState() {
-  await chrome.storage.local.remove(CC_TASK_STORAGE_KEY);
+  await chrome.storage.local.remove([CC_TASK_STORAGE_KEY, CC_CONTEXT_STORAGE_KEY]);
+}
+
+async function getYuqueCollectTaskState() {
+  const data = await chrome.storage.local.get(YUQUE_COLLECT_TASK_STORAGE_KEY);
+  return data[YUQUE_COLLECT_TASK_STORAGE_KEY] || null;
+}
+
+async function setYuqueCollectTaskState(task) {
+  const previous = await getYuqueCollectTaskState();
+  const nextTask = { ...(previous || {}), ...task };
+  await chrome.storage.local.set({ [YUQUE_COLLECT_TASK_STORAGE_KEY]: nextTask });
+  return nextTask;
+}
+
+async function clearYuqueCollectTaskState() {
+  await chrome.storage.local.remove(YUQUE_COLLECT_TASK_STORAGE_KEY);
+}
+
+async function startYuqueCollectTask(prefix, exportUserRequirements) {
+  const normalizedPrefix = String(prefix || "").trim();
+  if (!normalizedPrefix) {
+    throw new Error("请输入文件名前缀");
+  }
+
+  const existing = await getYuqueCollectTaskState();
+  if (existing && existing.status === "running") {
+    throw new Error("已有汇总任务正在执行，请稍后再试");
+  }
+
+  const taskId = `yuque-collect-${Date.now()}`;
+  await setYuqueCollectTaskState({
+    id: taskId,
+    status: "running",
+    prefix: normalizedPrefix,
+    message: "正在准备扫描...",
+    total: 0,
+    processed: 0,
+    collected: 0,
+    startedAt: new Date().toISOString(),
+    result: null,
+    error: ""
+  });
+
+  runYuqueCollectTask(taskId, normalizedPrefix, Boolean(exportUserRequirements)).catch(async (error) => {
+    await setYuqueCollectTaskState({
+      id: taskId,
+      status: "failed",
+      message: error.message || "需求汇总执行失败",
+      finishedAt: new Date().toISOString(),
+      error: error.message || "需求汇总执行失败"
+    });
+  });
+
+  return { taskId, status: "running" };
+}
+
+async function runYuqueCollectTask(taskId, prefix, exportUserRequirements) {
+  const tab = await getCurrentTab();
+  validatePageTab(tab);
+  await ensureContentScript(tab.id);
+
+  await setYuqueCollectTaskState({
+    id: taskId, status: "running", message: "正在扫描目录..."
+  });
+
+  const scanResult = await chrome.tabs.sendMessage(tab.id, {
+    type: "SCAN_YUQUE_TOC",
+    prefix
+  });
+
+  if (!scanResult || scanResult.ok === false) {
+    throw new Error(scanResult ? (scanResult.error || "目录扫描失败") : "目录扫描无响应");
+  }
+
+  const items = Array.isArray(scanResult.items) ? scanResult.items : [];
+
+  if (!items.length) {
+    await setYuqueCollectTaskState({
+      id: taskId,
+      status: "completed",
+      message: `未找到前缀为「${prefix}」的文件`,
+      total: 0, processed: 0, collected: 0,
+      result: { total: 0, collected: 0, skipped: 0 },
+      finishedAt: new Date().toISOString()
+    });
+    return;
+  }
+
+  await setYuqueCollectTaskState({
+    id: taskId, status: "running",
+    message: `找到 ${items.length} 个匹配文件，开始逐一访问...`,
+    total: items.length, processed: 0, collected: 0
+  });
+
+  const results = [];
+  const skippedTitles = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+
+    await setYuqueCollectTaskState({
+      id: taskId, status: "running",
+      message: `正在处理 ${i + 1}/${items.length}：${item.title}`,
+      processed: i
+    });
+
+    let workerTabId = null;
+    try {
+      const workerTab = await chrome.tabs.create({ url: item.url, active: false });
+      if (!workerTab || !workerTab.id) continue;
+      workerTabId = workerTab.id;
+
+      await waitForTabComplete(workerTabId);
+      await ensureContentScript(workerTabId);
+
+      const extractResult = await chrome.tabs.sendMessage(workerTabId, {
+        type: "EXTRACT_REQUIREMENTS_SECTION",
+        heading: "需求"
+      });
+
+      if (extractResult && extractResult.ok && extractResult.found) {
+        results.push({ title: item.title, url: item.url, content: extractResult.content });
+      } else {
+        skippedTitles.push(item.title);
+      }
+    } catch (error) {
+      skippedTitles.push(item.title);
+      console.log("[yuque-collect] extract failed", {
+        title: item.title,
+        error: error && error.message ? error.message : String(error)
+      });
+    } finally {
+      if (workerTabId) {
+        try { await chrome.tabs.remove(workerTabId); } catch (e) {}
+      }
+    }
+  }
+
+  const date = new Date().toISOString().slice(0, 10);
+  const markdown = buildRequirementsMarkdown(results, date, prefix);
+  const dataUrl = `data:text/markdown;charset=utf-8,${encodeURIComponent(markdown)}`;
+
+  await chrome.downloads.download({
+    url: dataUrl,
+    filename: `yuque-requirements-${date}.md`,
+    saveAs: false
+  });
+
+  if (exportUserRequirements) {
+    const userMarkdown = buildUserRequirementsMarkdown(results, date, prefix);
+    const userDataUrl = `data:text/markdown;charset=utf-8,${encodeURIComponent(userMarkdown)}`;
+    await chrome.downloads.download({
+      url: userDataUrl,
+      filename: `yuque-user-requirements-${date}.md`,
+      saveAs: false
+    });
+  }
+
+  const downloadMsg = exportUserRequirements
+    ? `汇总完成，已下载需求汇总和用户需求两个文件`
+    : `汇总完成，共收集 ${results.length}/${items.length} 个文件的需求，已自动下载`;
+
+  await setYuqueCollectTaskState({
+    id: taskId,
+    status: "completed",
+    message: downloadMsg,
+    total: items.length,
+    processed: items.length,
+    collected: results.length,
+    result: {
+      total: items.length,
+      collected: results.length,
+      skipped: skippedTitles.length,
+      skippedTitles
+    },
+    finishedAt: new Date().toISOString()
+  });
+}
+
+function buildRequirementsMarkdown(results, date, prefix) {
+  const CATEGORIES = [
+    { key: "开放", section: "## 新链路" },
+    { key: "支持", section: "## 新特性" },
+    { key: "优化", section: "## 优化" },
+    { key: "修复", section: "## 问题修复" }
+  ];
+
+  const buckets = { "开放": [], "支持": [], "优化": [], "修复": [], "其他": [] };
+
+  for (const result of results) {
+    const lines = result.content.split("\n");
+    for (const rawLine of lines) {
+      const text = rawLine.replace(/^[-+*]\s+/, "").replace(/^\d+\.\s+/, "").trim();
+      if (!text) continue;
+
+      // Skip lines that are sub-headings (###, ####)
+      if (/^#{2,}/.test(text)) continue;
+
+      // Skip lines marked as "不要写到rs中"
+      if (text.includes("（不要写到rs中）")) continue;
+
+      // Strip 【...】 user tag from end
+      const cleaned = text.replace(/【[^】]*】\s*$/, "").trim();
+
+      let categorized = false;
+      for (const { key } of CATEGORIES) {
+        if (cleaned.startsWith(key + " ") || cleaned.startsWith(key + "：")) {
+          buckets[key].push(`+ ${cleaned}`);
+          categorized = true;
+          break;
+        }
+      }
+      if (!categorized) {
+        buckets["其他"].push(`+ ${cleaned}`);
+      }
+    }
+  }
+
+  const sections = CATEGORIES
+    .filter(({ key }) => buckets[key].length > 0)
+    .map(({ key, section }) => `${section}\n${buckets[key].join("\n")}`);
+
+  if (buckets["其他"].length > 0) {
+    sections.push(`## 其他\n${buckets["其他"].join("\n")}`);
+  }
+
+  if (!sections.length) {
+    return `# 需求汇总 - ${date}\n\n> 前缀「${prefix}」下未找到有效需求条目。\n`;
+  }
+
+  return `# 需求汇总 - ${date}\n\n> 前缀：${prefix}　共来源 ${results.length} 个文件\n\n${sections.join("\n\n")}`;
+}
+
+function buildUserRequirementsMarkdown(results, date, prefix) {
+  const userMap = new Map(); // user -> [item lines]
+
+  for (const result of results) {
+    const lines = result.content.split("\n");
+    for (const rawLine of lines) {
+      const text = rawLine.replace(/^[-+*]\s+/, "").replace(/^\d+\.\s+/, "").trim();
+      if (!text || /^#{2,}/.test(text)) continue;
+
+      const bracketMatch = text.match(/【([^】]+)】\s*$/);
+      if (!bracketMatch) continue;
+
+      // Strip 【...】 user tag from end for display
+      const cleaned = text.replace(/【[^】]*】\s*$/, "").trim();
+
+      const users = bracketMatch[1].split(/[、，,]/).map((u) => u.trim()).filter(Boolean);
+      for (const user of users) {
+        if (!userMap.has(user)) userMap.set(user, []);
+        userMap.get(user).push(`+ ${cleaned}`);
+      }
+    }
+  }
+
+  if (!userMap.size) {
+    return `# 用户需求汇总 - ${date}\n\n> 前缀「${prefix}」下未找到带用户标注（中括号）的需求条目。\n`;
+  }
+
+  const sections = [...userMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b, "zh"))
+    .map(([user, items]) => `## ${user}\n${items.join("\n")}`);
+
+  return `# 用户需求汇总 - ${date}\n\n> 前缀：${prefix}　共 ${userMap.size} 位用户\n\n${sections.join("\n\n")}`;
 }
 
 async function loadCcAutomationConfig() {
@@ -1009,4 +1338,78 @@ async function setCcContextState(context) {
     [CC_CONTEXT_STORAGE_KEY]: nextContext
   });
   return nextContext;
+}
+
+async function runWithCcStartLock(run) {
+  if (ccStartInFlight) {
+    throw new Error("CC 自动化测试正在启动中，请稍后再试");
+  }
+  ccStartInFlight = true;
+  try {
+    return await run();
+  } finally {
+    ccStartInFlight = false;
+  }
+}
+
+async function assertCcTaskIdle() {
+  const current = await getCcTaskState();
+  if (current && current.status === "running") {
+    throw new Error(`已有任务正在执行：${current.message || current.id || "请稍后重试"}`);
+  }
+}
+
+function buildCcRuntimeContext(savedContext, siteOrigin) {
+  if (!savedContext || typeof savedContext !== "object") {
+    return { _siteOrigin: siteOrigin };
+  }
+  if (savedContext._siteOrigin && savedContext._siteOrigin !== siteOrigin) {
+    return { _siteOrigin: siteOrigin };
+  }
+  return {
+    ...savedContext,
+    _siteOrigin: siteOrigin
+  };
+}
+
+function getMissingRequiredContext(requiredContext, context) {
+  const required = Array.isArray(requiredContext) ? requiredContext : [];
+  return required.filter((key) => !hasResolvedContextValue(context && context[key]));
+}
+
+function hasResolvedContextValue(value) {
+  if (value == null) {
+    return false;
+  }
+  const text = String(value).trim();
+  if (!text) {
+    return false;
+  }
+  return !/\$\{(config|context)\.[^}]+\}/.test(text);
+}
+
+function findStepTemplateVars(step) {
+  const vars = [];
+  if (!step || typeof step !== "object") {
+    return vars;
+  }
+  Object.values(step).forEach((value) => {
+    collectTemplateVars(value, vars);
+  });
+  return Array.from(new Set(vars));
+}
+
+function collectTemplateVars(value, vars) {
+  if (typeof value === "string") {
+    const matches = value.match(/\$\{(config|context)\.[^}]+\}/g) || [];
+    matches.forEach((item) => vars.push(item));
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectTemplateVars(item, vars));
+    return;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((item) => collectTemplateVars(item, vars));
+  }
 }

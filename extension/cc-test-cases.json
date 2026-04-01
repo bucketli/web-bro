@@ -135,6 +135,73 @@
       ]
     },
     {
+      "id": "cluster-detail-check",
+      "name": "集群详情（机器列表）页面检查",
+      "passCriteria": "点击测试集群进入机器列表页，页面无报错",
+      "dependsOn": ["cluster-create"],
+      "steps": [
+        { "type": "navigate", "path": "/#/ccsystem/resource" },
+        { "type": "wait", "ms": 600 },
+        { "type": "find_row_by_text_and_click", "rowText": "${config.clusterCreate.description}", "text": "机器列表", "timeout": 8000 },
+        { "type": "assert_url_contains", "contains": "/ccsystem/resource/", "timeout": 8000 },
+        { "type": "wait", "ms": 1000 },
+        { "type": "assert_no_errors" }
+      ]
+    },
+    {
+      "id": "worker-add",
+      "name": "添加机器",
+      "passCriteria": "进入集群机器列表后点击新增机器，并完成手动部署下的机器创建动作，无报错",
+      "dependsOn": ["cluster-detail-check"],
+      "steps": [
+        { "type": "navigate", "path": "/#/ccsystem/resource" },
+        { "type": "wait", "ms": 600 },
+        { "type": "find_row_by_text_and_click", "rowText": "${config.clusterCreate.description}", "text": "机器列表", "timeout": 8000 },
+        { "type": "wait", "ms": 1200 },
+        { "type": "click_button", "text": "新增机器", "timeout": 8000 },
+        { "type": "wait_for_modal", "timeout": 8000 },
+        { "type": "click_selector", "selector": ".add-worker-step-desc .ivu-btn-primary, .add-worker-step-desc .ant-btn-primary", "timeout": 10000 },
+        { "type": "wait", "ms": 2500 },
+        { "type": "assert_no_errors" }
+      ]
+    },
+    {
+      "id": "worker-monitor-check",
+      "name": "机器监控页面检查",
+      "passCriteria": "进入机器列表后打开机器监控页，页面无报错",
+      "dependsOn": ["worker-add"],
+      "steps": [
+        { "type": "navigate", "path": "/#/ccsystem/resource" },
+        { "type": "wait", "ms": 600 },
+        { "type": "find_row_by_text_and_click", "rowText": "${config.clusterCreate.description}", "text": "机器列表", "timeout": 8000 },
+        { "type": "wait", "ms": 1200 },
+        { "type": "select_worker_with_action", "action": "monitor", "timeout": 10000 },
+        { "type": "click_selector", "selector": ".worker-item-selected .to-monitor-icon, .worker-item-content .to-monitor-icon", "timeout": 8000 },
+        { "type": "assert_url_contains", "contains": "/monitor/worker/graph", "timeout": 10000 },
+        { "type": "wait", "ms": 1000 },
+        { "type": "assert_no_errors" }
+      ]
+    },
+    {
+      "id": "worker-delete",
+      "name": "删除机器",
+      "passCriteria": "在机器列表中选中可删除机器并确认删除，无报错",
+      "dependsOn": ["worker-add"],
+      "steps": [
+        { "type": "navigate", "path": "/#/ccsystem/resource" },
+        { "type": "wait", "ms": 600 },
+        { "type": "find_row_by_text_and_click", "rowText": "${config.clusterCreate.description}", "text": "机器列表", "timeout": 8000 },
+        { "type": "wait", "ms": 1200 },
+        { "type": "select_worker_with_action", "action": "delete", "timeout": 12000 },
+        { "type": "click_selector", "selector": ".worker-item-selected .worker-action-item:not(.worker-action-item-disabled) .icondel", "timeout": 8000 },
+        { "type": "wait_for_modal", "timeout": 8000 },
+        { "type": "fill_input_in_modal", "value": "DELETE_WORKER" },
+        { "type": "click_button_in_modal", "text": "确定" },
+        { "type": "wait", "ms": 2000 },
+        { "type": "assert_no_errors" }
+      ]
+    },
+    {
       "id": "fsm-list-check",
       "name": "状态机列表页面检查",
       "passCriteria": "导航到 /#/ccsystem/fsm 页面后无报错",
